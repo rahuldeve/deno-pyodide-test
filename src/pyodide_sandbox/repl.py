@@ -8,28 +8,30 @@
   and echoes the value of a bare last expression, as a REPL would.
 - `repl_history` returns the code of earlier cells, and their output on request.
 
+With `variables=` (or a shared `store=`), code in a cell reads host values as
+`host.NAME` (see `pyodide_sandbox.variables`).
+
 Every cell is kept on the host, and the instructions carry an index of them built
 from that record rather than from the conversation. So whatever a compaction
 strategy does to old tool calls and results (clears, summarises or drops them),
 the model can still see what it ran and fetch it again with `repl_history`.
 Compaction capabilities can be listed in any order relative to `PyodideRepl`.
 
-    repl = PyodideRepl(on_change="append")
+    repl = PyodideRepl(variables={"df": df}, on_change="append")
     agent = Agent(
         "anthropic:claude-sonnet-5-5",
         capabilities=[ClearToolResults(max_tokens=50_000), repl],
     )
 
-Ported from eryx-test's `EryxRepl`. Phase 0 leaves out its host variables (`store`),
-`host.tools` and snapshots. See `pyodide_sandbox.session` for the process boundary.
+Ported from eryx-test's `EryxRepl`, without its `host.tools` and snapshots so far. See `pyodide_sandbox.session` for the process boundary.
 """
 
 import asyncio
 import threading
 import time
 import weakref
-from collections.abc import Sequence
-from dataclasses import KW_ONLY, dataclass, field
+from collections.abc import Mapping, Sequence
+from dataclasses import KW_ONLY, InitVar, dataclass, field
 from pathlib import Path
 from typing import Any, Self
 
@@ -45,6 +47,7 @@ from pyodide_sandbox.session import (
     SessionError,
     SessionTimeout,
 )
+from pyodide_sandbox.variables import VariableStore
 
 INSTRUCTIONS = """\
 You have a persistent, sandboxed Python REPL. Run code with `run_code`: \
@@ -110,7 +113,9 @@ class PyodideRepl(AbstractCapability[Any]):
     with the cell history, until `reset()`. A cell that runs past
     `execution_timeout_ms`, or that crashes the process, gets the process killed; the
     next cell starts a new one, without the earlier variables. If a session can't
-    start, `run_code` raises `RuntimeError`, which ends the run.
+    start, `run_code` raises `RuntimeError`, which ends the run. Every new session
+    gives the cells `host`, reading `store`; host values live on the host, so they
+    survive restarts.
 
     An instance belongs to the first agent it is given to; another agent gets a
     `ValueError`. It should also serve one conversation at a time, which isn't
@@ -124,6 +129,20 @@ class PyodideRepl(AbstractCapability[Any]):
     """Pyodide packages loaded and imported when a session starts; each adds startup time."""
 
     _: KW_ONLY
+
+    store: VariableStore | None = None
+    """Host values the model reads as `host.NAME` (see `pyodide_sandbox.variables`).
+
+    `None` creates one from `variables`. A store passed in belongs to the caller,
+    and can be shared by several REPLs. It can't be replaced afterwards."""
+
+    variables: InitVar[Mapping[str, Any] | None] = None
+    """Shorthand for `store=VariableStore(variables)`. The values are copied and
+    pickled when the capability is created, so later changes on the host aren't
+    seen. Unpickling happens in the sandbox, when a cell reads one, so it needs the
+    values' modules (e.g. pandas, among `packages`) and can't load classes defined
+    only on the host. Only an init argument: read `store` afterwards, as this
+    attribute stays `None`."""
 
     execution_timeout_ms: int | None = 60_000
     """Time limit for one cell; at the limit the process is killed. `None` removes it."""
@@ -166,12 +185,26 @@ class PyodideRepl(AbstractCapability[Any]):
         default=None, init=False, repr=False
     )
 
-    def __post_init__(self) -> None:
+    def __setattr__(self, name: str, value: Any) -> None:
+        # A running session keeps the store it was started with, so a new one would
+        # put the instructions and `host` out of step
+        if name == "store" and self.__dict__.get("store") is not None:
+            raise AttributeError("PyodideRepl.store can't be changed after creation")
+        if name == "variables":
+            raise AttributeError("PyodideRepl.variables is only an init argument")
+        super().__setattr__(name, value)
+
+    def __post_init__(self, variables: Mapping[str, Any] | None) -> None:
         # Appended instruction changes are addressed by the capability's id
         if self.id is None:
             self.id = "pyodide_repl"
         if self.index_cells < 0:
             raise ValueError(f"index_cells must be >= 0, got {self.index_cells}")
+        if self.store is not None and variables is not None:
+            raise ValueError("pass variables or store, not both")
+        if self.store is None:
+            # Pickled now so an unpicklable value fails here, not on the first call
+            self.store = VariableStore(variables)
         self.packages = tuple(self.packages)
         # Each call runs alone, in the order the model made them: the session can
         # only run one cell at a time, and later cells may use earlier ones' variables
@@ -209,6 +242,11 @@ class PyodideRepl(AbstractCapability[Any]):
         """Stop the session's process; the next cell starts a new one."""
         with self._lock:
             self._close_session()
+
+    @property
+    def _host(self) -> VariableStore:
+        assert self.store is not None, "set in __post_init__"
+        return self.store
 
     def get_toolset(self) -> FunctionToolset[Any]:
         return self._toolset
@@ -269,6 +307,13 @@ class PyodideRepl(AbstractCapability[Any]):
             packages=", ".join(self.packages) or "the standard library only",
             numerics=NUMERICS if "numpy" in self.packages else "",
         )
+        if names := self._host.names():
+            listed = ", ".join(f"{n} ({self._host.info(n).type})" for n in names)
+            text += (
+                f"\n\nHost variables (read-only): {listed}. Read one with "
+                f"`host.NAME`, e.g. `{names[0]} = host.{names[0]}`; each read "
+                "returns a fresh copy."
+            )
         if not self._cells:
             return text
         # -0 would slice from the start and list every cell
@@ -285,9 +330,10 @@ class PyodideRepl(AbstractCapability[Any]):
                 deno=self.deno,
                 dist_dir=self.dist_dir,
                 max_output_bytes=self.max_output_bytes,
+                store=self._host,
             )
             # Failures here are host setup problems (no Deno, no distribution, a
-            # package that won't load), not something for the model to see as a
+            # package that won't load, a closed store), not something for the model to see as a
             # cell error
             try:
                 session.start(timeout=self.startup_timeout_ms / 1000)
@@ -307,7 +353,10 @@ class PyodideRepl(AbstractCapability[Any]):
     def _restart(self) -> str:
         """Drop a session that was killed or crashed."""
         self._close_session()
-        return "; the sandbox was restarted and variables from earlier cells are gone"
+        note = "; the sandbox was restarted and variables from earlier cells are gone"
+        if self._host.names():
+            note += "; host variables are unchanged"
+        return note
 
     def _execute(self, code: str) -> Cell:
         with self._lock:

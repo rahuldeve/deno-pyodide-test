@@ -1,8 +1,8 @@
-"""Let a pydantic-ai agent analyse data through the Pyodide REPL capability.
+"""Let a pydantic-ai agent analyse a host DataFrame through the Pyodide REPL capability.
 
-Ported from eryx-test's script of the same name. Phase 0 has no host variables, so
-the agent's first cell builds the weather data itself, from a seed. Two questions
-are asked as two `agent.run()` calls sharing one conversation and one Pyodide
+Ported from eryx-test's script of the same name. The weather frame is built on the
+host and passed in as a host variable, so the agent's cells read it as `host.df`.
+Two questions are asked as two `agent.run()` calls sharing one conversation and one Pyodide
 session. `ClearToolResults` is set to clear aggressively so that, by the second
 question, early cell outputs are gone from the conversation; the model can still
 find them through the cell index in the instructions and `repl_history`.
@@ -14,6 +14,8 @@ Needs ANTHROPIC_API_KEY (or set AGENT_MODEL to another pydantic-ai model).
 
 import os
 
+import numpy as np
+import pandas as pd
 from pydantic_ai import Agent, capture_run_messages
 from pydantic_ai.messages import ModelRequest, ToolReturnPart
 from pydantic_ai_harness.compaction import ClearToolResults
@@ -23,33 +25,39 @@ from pyodide_sandbox import PyodideRepl
 MODEL = os.environ.get("AGENT_MODEL", "anthropic:claude-sonnet-5-5")
 CLEARED = "[tool result cleared]"  # ClearToolResults' default placeholder
 
-SETUP = """\
-Start by building the data in the REPL, exactly as follows:
 
-```python
-import numpy as np, pandas as pd
-rng = np.random.default_rng(0)
-days = pd.date_range("2026-01-01", periods=120, freq="D")
-df = pd.concat(
-    pd.DataFrame({
-        "date": days,
-        "city": city,
-        "temp": base + 8 * np.sin(np.arange(120) / 19) + rng.normal(0, 2, 120),
-        "rain": np.where(rng.random(120) < p, rng.gamma(2, 3, 120), 0.0),
-    })
-    for city, base, p in [("Oslo", 2, 0.45), ("Lisbon", 15, 0.25), ("Cairo", 22, 0.03)]
-)
-```
-"""
+def make_weather() -> pd.DataFrame:
+    """Daily weather for three cities over 120 days."""
+    rng = np.random.default_rng(0)
+    days = pd.date_range("2026-01-01", periods=120, freq="D", tz="Europe/Lisbon")
+    return pd.concat(
+        pd.DataFrame(
+            {
+                "date": days,
+                "city": city,
+                "temp": base + 8 * np.sin(np.arange(120) / 19) + rng.normal(0, 2, 120),
+                "rain": np.where(rng.random(120) < p, rng.gamma(2, 3, 120), 0.0),
+            }
+        )
+        for city, base, p in [
+            ("Oslo", 2, 0.45),
+            ("Lisbon", 15, 0.25),
+            ("Cairo", 22, 0.03),
+        ]
+    )
+
 
 QUESTIONS = [
-    "Which city had the most rain in total, and on how many days did it rain there?",
+    (
+        "`host.df` holds daily weather for three cities. Which city had the most rain "
+        "in total, and on how many days did it rain there?"
+    ),
     "For that city, what was the warmest week (7-day rolling mean of temp)?",
 ]
 
 
 def main() -> None:
-    repl = PyodideRepl(on_change="append")
+    repl = PyodideRepl(variables={"df": make_weather()}, on_change="append")
     agent = Agent(
         MODEL,
         instructions="Answer questions about the data by running code in the REPL.",
@@ -58,11 +66,10 @@ def main() -> None:
 
     history = None
     try:
-        for i, question in enumerate(QUESTIONS):
-            prompt = SETUP + "\n" + question if i == 0 else question
+        for question in QUESTIONS:
             print(f"\n### {question}")
             with capture_run_messages() as messages:
-                result = agent.run_sync(prompt, message_history=history)
+                result = agent.run_sync(question, message_history=history)
             history = result.all_messages()
             print(result.output)
             cleared = [

@@ -2,8 +2,8 @@
 
 The process is the boundary, not Pyodide: code in a cell can reach JavaScript, so
 everything worth protecting stays on this side. Deno runs with no network, write,
-subprocess, FFI or environment access, can read only its own files and the Pyodide
-distribution, and gets an environment without the host's secrets. A cell over its
+subprocess, FFI or environment access, can read only its own files, the Pyodide
+distribution and the variable store, if any, and gets an environment without the host's secrets. A cell over its
 time limit gets the process SIGKILLed, since Python inside Pyodide can catch an
 interrupt and a long C call wouldn't see one. Every message from Deno is checked
 before use, as a cell can write to the pipe itself.
@@ -29,9 +29,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any
 
+from pyodide_sandbox.variables import VariableStore
+
 ROOT = Path(__file__).resolve().parents[2]
 DENO_DIR = ROOT / "deno"
-DEFAULT_PACKAGES = ("numpy", "pandas")
+# tzdata: pandas and zoneinfo find no time zone without it (no system zoneinfo in wasm)
+DEFAULT_PACKAGES = ("numpy", "pandas", "tzdata")
 
 # Limits on what Deno sends back; the in-sandbox cap on each stream is the real one
 _MAX_LINE_BYTES = 8 << 20
@@ -77,7 +80,8 @@ class PyodideSession:
     """A Deno process running one Pyodide interpreter; variables persist between cells.
 
     Not thread-safe: run one cell at a time. After `SessionError` the session is
-    dead and every later call raises it again.
+    dead and every later call raises it again. With `store`, cells read its values
+    as `host.NAME`; the session keeps the store open while it holds it.
     """
 
     def __init__(
@@ -87,6 +91,7 @@ class PyodideSession:
         deno: str | None = None,
         dist_dir: str | Path | None = None,
         max_output_bytes: int = 1 << 20,
+        store: VariableStore | None = None,
     ) -> None:
         for name in packages:
             if not name.isidentifier():
@@ -95,6 +100,7 @@ class PyodideSession:
         self.deno = deno or default_deno()
         self.dist_dir = Path(dist_dir) if dist_dir else default_dist_dir()
         self.max_output_bytes = max_output_bytes
+        self.store = store
         self.boot_ms: float | None = None
         self._proc: subprocess.Popen[bytes] | None = None
         self._messages: queue.Queue[dict[str, Any] | None] = queue.Queue()
@@ -107,7 +113,11 @@ class PyodideSession:
             raise RuntimeError(
                 f"no Pyodide distribution in {self.dist_dir}; run `poe setup`"
             )
-        readable = f"{DENO_DIR},{self.dist_dir.resolve()}"
+        readable = [DENO_DIR, self.dist_dir.resolve()]
+        store = []
+        if self.store is not None:
+            readable.append(self.store.directory)
+            store = ["--store", str(self.store.directory)]
         return [
             self.deno,
             "run",
@@ -115,7 +125,7 @@ class PyodideSession:
             "--cached-only",
             "--no-remote",
             f"--config={DENO_DIR / 'deno.json'}",
-            f"--allow-read={readable}",
+            f"--allow-read={','.join(map(str, readable))}",
             str(DENO_DIR / "main.ts"),
             "--dist",
             str(self.dist_dir.resolve()),
@@ -123,6 +133,7 @@ class PyodideSession:
             ",".join(self.packages),
             "--max-output-bytes",
             str(self.max_output_bytes),
+            *store,
         ]
 
     @property

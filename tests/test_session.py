@@ -14,7 +14,7 @@ from pyodide_sandbox.session import (
 
 @pytest.fixture(scope="module")
 def numpy_session() -> Iterator[PyodideSession]:
-    session = PyodideSession(("numpy", "pandas"))
+    session = PyodideSession()
     session.start()
     yield session
     session.close()

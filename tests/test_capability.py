@@ -5,9 +5,12 @@ packages, so each session boots in about 2 s instead of 6.
 """
 
 import asyncio
+import copy
+import dataclasses
 import gc
+import pickle
 import warnings
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import pytest
@@ -26,6 +29,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai_harness.compaction import ClearToolResults
 
 from pyodide_sandbox.repl import NUMERICS, PyodideRepl
+from pyodide_sandbox.variables import VariableStore
 
 Call = tuple[str, dict[str, object]]
 
@@ -66,6 +70,20 @@ def repl() -> Iterator[PyodideRepl]:
     repl = PyodideRepl((), execution_timeout_ms=2000)
     yield repl
     repl.close()
+
+
+@pytest.fixture
+def make_repl() -> Iterator[Callable[..., PyodideRepl]]:
+    """`PyodideRepl` with no packages by default; each is closed after the test."""
+    made: list[PyodideRepl] = []
+
+    def make(*args: Any, **kwargs: Any) -> PyodideRepl:
+        made.append(PyodideRepl(*(args or [()]), **kwargs))
+        return made[-1]
+
+    yield make
+    for repl in made:
+        repl.close()
 
 
 def make_agent(
@@ -136,9 +154,9 @@ def test_instructions_index_cells(repl: PyodideRepl) -> None:
 def test_instructions_describe_the_sandbox() -> None:
     bare = PyodideRepl(())._instructions_text()
     assert "Loaded: the standard library only." in bare
-    assert "Numerical errors" not in bare
+    assert NUMERICS not in bare
     full = PyodideRepl()._instructions_text()
-    assert "Loaded: numpy, pandas." in full
+    assert "Loaded: numpy, pandas, tzdata." in full
     assert full.endswith(NUMERICS)
 
 
@@ -321,6 +339,164 @@ def test_reset(repl: PyodideRepl) -> None:
     assert repl.cells[0].error == "NameError"
 
 
+# Host variables (`host.NAME`), ported from eryx-test
+
+
+class HostOnly:
+    """A class the sandbox can't import, so it can't unpickle instances of it."""
+
+
+def instructions(script: Script) -> str:
+    _, info = script.requests[-1]
+    assert info.instructions is not None
+    return info.instructions
+
+
+def test_host_variables(make_repl: Callable[..., PyodideRepl]) -> None:
+    repl = make_repl(variables={"x": 1, "data": {"a": [1, 2]}})
+    script = Script(
+        run_cells(
+            "host.x, host['data']",
+            "[n for n in ('Host', 'pickle', 'json', 'setup_host') if n in globals()]",
+        )
+    )
+    make_agent(repl, script).run_sync("go")
+
+    values, leaked = repl.cells
+    assert values.stdout == "(1, {'a': [1, 2]})\n"
+    assert leaked.stdout == "[]\n"
+    assert (
+        "Host variables (read-only): x (int), data (dict). Read one with `host.NAME`, "
+        "e.g. `x = host.x`; each read returns a fresh copy."
+    ) in instructions(script)
+
+
+def test_changing_the_passed_dict_changes_nothing(
+    make_repl: Callable[..., PyodideRepl],
+) -> None:
+    variables: dict[str, object] = {"x": 1}
+    repl = make_repl(variables=variables)
+    variables["x"] = [1, 2, 3]
+    variables["y"] = "added later"
+    script = Script(run_cells("host.x, 'y' in host"))
+    make_agent(repl, script).run_sync("go")
+
+    assert repl.cells[0].stdout == "(1, False)\n"
+    assert "Host variables (read-only): x (int)." in instructions(script)
+
+
+def test_no_host_variables(repl: PyodideRepl) -> None:
+    script = Script(run_cells("list(host)"))
+    make_agent(repl, script).run_sync("go")
+
+    assert repl.cells[0].stdout == "[]\n"
+    assert "Host variables" not in instructions(script)
+
+
+def test_model_variable_and_host_variable_are_independent(
+    make_repl: Callable[..., PyodideRepl],
+) -> None:
+    repl = make_repl(variables={"x": 1})
+    make_agent(repl, Script(run_cells("x = host.x\nx += 1", "x, host.x"))).run_sync(
+        "go"
+    )
+    assert repl.cells[-1].stdout == "(2, 1)\n"
+
+
+def test_host_variables_survive_a_restart(
+    make_repl: Callable[..., PyodideRepl],
+) -> None:
+    repl = make_repl(variables={"x": 1}, execution_timeout_ms=1000)
+    script = Script(run_cells("y = 2", "while True: pass", "'y' in globals(), host.x"))
+    make_agent(repl, script).run_sync("go")
+
+    _, timed_out, after = repl.cells
+    assert timed_out.error is not None
+    assert timed_out.error.endswith(
+        "variables from earlier cells are gone; host variables are unchanged"
+    )
+    assert after.stdout == "(False, 1)\n"
+
+
+def test_shared_store(make_repl: Callable[..., PyodideRepl]) -> None:
+    with VariableStore({"x": 1}) as store:
+        for repl in (make_repl(store=store), make_repl(store=store)):
+            make_agent(repl, Script(run_cells("host.x"))).run_sync("go")
+            assert repl.cells[0].stdout == "1\n"
+
+
+def test_store_and_variables_together() -> None:
+    with VariableStore() as store, pytest.raises(ValueError, match="not both"):
+        PyodideRepl(store=store, variables={"x": 1})
+
+
+@pytest.mark.parametrize("private", [True, False])
+def test_store_and_variables_cannot_be_reassigned(
+    make_repl: Callable[..., PyodideRepl], private: bool
+) -> None:
+    # A running session keeps the store it started with, so the instructions would
+    # list one store while `host` reads another
+    variables = {"x": 1}
+    repl = (
+        make_repl(variables=variables)
+        if private
+        else make_repl(store=VariableStore(variables))
+    )
+    store = repl.store
+    make_agent(repl, Script(run_cells("host.x"))).run_sync("go")
+
+    with pytest.raises(AttributeError, match="store can't be changed"):
+        repl.store = VariableStore({"y": 2})
+    with pytest.raises(AttributeError, match="only an init argument"):
+        repl.variables = {"y": 2}
+
+    assert repl.store is store
+    make_agent(repl, Script(run_cells("host.x"))).run_sync("go")
+    assert repl.cells[-1].stdout == "1\n"
+
+
+def test_copies_keep_the_store() -> None:
+    repl = PyodideRepl(variables={"x": 1})
+    assert copy.copy(repl).store is repl.store
+    assert dataclasses.replace(repl).store is repl.store
+
+
+@pytest.mark.parametrize(
+    ("variables", "error"),
+    [
+        ({"not-a-name": 1}, ValueError),
+        ({"class": 1}, ValueError),
+        ({"f": lambda: 0}, (pickle.PicklingError, AttributeError)),
+    ],
+)
+def test_bad_variables_fail_at_construction(
+    variables: dict[str, object], error: type[Exception]
+) -> None:
+    with pytest.raises(error):
+        PyodideRepl(variables=variables)
+
+
+def test_variable_the_sandbox_cannot_load(
+    make_repl: Callable[..., PyodideRepl],
+) -> None:
+    # unpickled when a cell reads it, so the model sees the error in that cell
+    repl = make_repl(variables={"obj": HostOnly(), "x": 1})
+    make_agent(repl, Script(run_cells("host.obj", "host.x"))).run_sync("go")
+
+    failed, ok = repl.cells
+    assert failed.error == "ModuleNotFoundError"
+    assert ok.stdout == "1\n"
+
+
+def test_closed_store_fails_the_start() -> None:
+    store = VariableStore({"x": 1})
+    store.close()
+    repl = PyodideRepl((), store=store)
+    with pytest.raises(RuntimeError, match="starting the PyodideRepl session failed"):
+        make_agent(repl, Script(run_cells("1"))).run_sync("go")
+    assert repl.cells == []
+
+
 def test_dropping_the_repl_stops_its_process() -> None:
     repl = PyodideRepl(())
     make_agent(repl, Script(run_cells("1"))).run_sync("go")
@@ -383,16 +559,29 @@ def test_rebinds_after_agent_is_gone(repl: PyodideRepl) -> None:
 
 
 def test_numpy_and_pandas() -> None:
-    repl = PyodideRepl()
+    import pandas as pd
+
+    rain = pd.DataFrame(
+        {
+            "city": ["a", "b", "a"],
+            "rain": [1.0, 2.5, 3.0],
+            "day": pd.date_range("2026-01-01", periods=3, tz="Europe/Oslo"),
+        }
+    )
+    repl = PyodideRepl(variables={"rain": rain})
     try:
         script = Script(
             run_cells(
                 "import pandas as pd\n"
                 "df = pd.DataFrame({'city': ['a', 'b', 'a'], 'rain': [1.0, 2.5, 3.0]})",
                 "df.groupby('city').rain.sum().to_dict()",
+                "r = host.rain\nr.equals(df.assign(day=r.day)), str(r.day.dt.tz)",
             )
         )
         make_agent(repl, script).run_sync("go")
-        assert repl.cells[-1].stdout == "{'a': 4.0, 'b': 2.5}\n"
+        _, local, from_host = repl.cells
+        assert local.stdout == "{'a': 4.0, 'b': 2.5}\n"
+        assert from_host.stdout == "(True, 'Europe/Oslo')\n"
+        assert "Host variables (read-only): rain (DataFrame)." in instructions(script)
     finally:
         repl.close()

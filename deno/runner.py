@@ -12,6 +12,8 @@ Pyodide already keeps state between calls and can return a cell's last expressio
 Output isn't captured here: main.ts captures the process's stdout and stderr per
 cell, which also catches what C extensions write. The cell's variables live in
 `__main__`, so classes and functions the model defines can be pickled.
+
+With a variable store, `setup_host` also defines `host` there (see `host.py`).
 """
 
 import ast
@@ -19,11 +21,41 @@ import linecache
 import sys
 import traceback
 
+import js
 from pyodide.code import CodeRunner
+from pyodide.ffi import JsException
 
 import __main__
 
 _CELL_PREFIX = "<cell-"
+_HOST_FILENAME = "<host>"
+
+
+def setup_host(source: str, root: str) -> None:
+    """Define `host` in `__main__`, reading the store at `root` through Deno.
+
+    `source` is host.py, run in a namespace of its own so that only `host` reaches
+    the cells. The store is read once here, so a missing one fails the boot.
+    """
+    linecache.cache[_HOST_FILENAME] = (
+        len(source),
+        None,
+        source.splitlines(True),
+        _HOST_FILENAME,
+    )
+    namespace = {"__name__": "pyodide_host"}
+    exec(compile(source, _HOST_FILENAME, "exec"), namespace)  # noqa: S102
+    host = namespace["Host"](root, _read_through_deno)
+    len(host)
+    __main__.host = host
+
+
+def _read_through_deno(path: str) -> bytes:
+    # Not a mount: see pyodide_sandbox.variables for why
+    try:
+        return js.Deno.readFileSync(path).to_bytes()
+    except JsException as e:
+        raise OSError(f"can't read the host's variable store: {e}") from None
 
 
 async def run_cell(code: str, number: int) -> str | None:

@@ -12,6 +12,9 @@
 // write to the pipe itself, so the host treats every message as untrusted.
 //
 // Usage: deno run <flags> main.ts --dist DIR [--packages numpy,pandas] [--max-output-bytes N]
+//                                [--store DIR]
+//
+// With --store, cells read the host's variables in DIR as `host.NAME` (runner.setup_host).
 
 import { loadPyodide } from "pyodide";
 
@@ -85,6 +88,12 @@ pyodide.runPython(runnerSource, {
   filename: "<runner>",
 });
 const runCell = runnerNamespace.get("run_cell");
+if (args.store) {
+  const hostSource = await Deno.readTextFile(
+    new URL("./host.py", import.meta.url),
+  );
+  runnerNamespace.get("setup_host")(hostSource, args.store);
+}
 for (const pkg of args.packages) {
   pyodide.runPython(`import ${pkg}`); // so the first cell doesn't pay for it
 }
@@ -148,6 +157,7 @@ function parseArgs(argv: string[]) {
     dist: "",
     packages: [] as string[],
     maxOutputBytes: 1 << 20,
+    store: "",
   };
   for (let i = 0; i < argv.length; i++) {
     const value = argv[i + 1];
@@ -158,6 +168,10 @@ function parseArgs(argv: string[]) {
         break;
       case "--packages":
         options.packages = value.split(",").filter(Boolean);
+        i++;
+        break;
+      case "--store":
+        options.store = value;
         i++;
         break;
       case "--max-output-bytes":

@@ -8,6 +8,7 @@ from pyodide_sandbox.session import (
     SessionError,
     SessionTimeout,
 )
+from pyodide_sandbox.variables import VariableStore
 
 __all__ = [
     "Cell",
@@ -17,4 +18,5 @@ __all__ = [
     "SessionCrashed",
     "SessionError",
     "SessionTimeout",
+    "VariableStore",
 ]
