@@ -6,6 +6,9 @@ The mirror here is a `file://` URL to the cache that the sessions use, so only t
 
 import json
 import shutil
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -13,8 +16,11 @@ import pytest
 from pyodide_sandbox.distribution import (
     CORE_FILES,
     LOCK_FILE,
+    PYODIDE_VERSION,
     SANDBOX_VERSIONS,
     DistributionError,
+    _locked,
+    default_dist_dir,
     ensure_distribution,
     import_names,
 )
@@ -119,3 +125,47 @@ def test_import_names(cache: Path) -> None:
 def test_sandbox_versions_match_the_lock_file(cache: Path) -> None:
     packages = json.loads((cache / LOCK_FILE).read_text())["packages"]
     assert {n: packages[n]["version"] for n in SANDBOX_VERSIONS} == SANDBOX_VERSIONS
+
+
+# Another process holding the lock for 1.5 s
+HOLD_THE_LOCK = """
+import sys, time
+from pathlib import Path
+from pyodide_sandbox.distribution import _locked
+with _locked(Path(sys.argv[1])):
+    print("locked", flush=True)
+    time.sleep(1.5)
+"""
+
+
+def test_the_download_lock_waits_for_another_process(tmp_path: Path) -> None:
+    holder = subprocess.Popen(
+        [sys.executable, "-c", HOLD_THE_LOCK, str(tmp_path / ".lock")],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout is not None and holder.stdout.readline() == "locked\n"
+        start = time.perf_counter()
+        with _locked(tmp_path / ".lock"):
+            waited = time.perf_counter() - start
+    finally:
+        holder.wait(timeout=10)
+    assert waited > 0.5
+    with _locked(tmp_path / ".lock"):  # released, so taken again at once
+        pass
+
+
+def test_default_dist_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    for name in ("PYODIDE_DIST_DIR", "XDG_CACHE_HOME", "LOCALAPPDATA"):
+        monkeypatch.delenv(name, raising=False)
+    if sys.platform == "win32":
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+        expected = tmp_path / "local"
+    else:
+        expected = Path.home() / ".cache"
+    assert default_dist_dir() == expected / "pyodide-sandbox" / PYODIDE_VERSION
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+    assert default_dist_dir() == tmp_path / "xdg" / "pyodide-sandbox" / PYODIDE_VERSION
+    monkeypatch.setenv("PYODIDE_DIST_DIR", str(tmp_path / "dist"))
+    assert default_dist_dir() == tmp_path / "dist"

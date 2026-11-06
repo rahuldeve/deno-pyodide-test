@@ -1,5 +1,9 @@
 """PyodideSession: one Deno process running Pyodide, driven over JSON lines."""
 
+import os
+import signal
+import sys
+import tempfile
 import time
 from collections.abc import Iterator
 
@@ -218,7 +222,9 @@ def test_timeout_kills_a_python_loop(bare: PyodideSession) -> None:
         bare.run("while True: pass", timeout=1)
     assert time.perf_counter() - start < 1.5
     assert not bare.alive
-    assert bare._proc is not None and bare._proc.returncode == -9
+    # SIGKILL; on Windows TerminateProcess, whose exit code is 1
+    killed = 1 if sys.platform == "win32" else -signal.SIGKILL
+    assert bare._proc is not None and bare._proc.returncode == killed
     with pytest.raises(SessionTimeout):
         bare.run("1")
 
@@ -247,13 +253,24 @@ def test_timeout_cannot_be_caught(bare: PyodideSession) -> None:
 
 # The process is the boundary: what Deno's flags allow from inside a cell
 
+# Targets that exist on the platform, so that Deno refuses rather than not finding
+# them
+if sys.platform == "win32":
+    _SYSTEM = os.environ.get("SYSTEMROOT", r"C:\Windows")
+    _READABLE = rf"{_SYSTEM}\win.ini"
+    _WRITABLE = os.path.join(tempfile.gettempdir(), "pyodide-sandbox-test")
+    _PROGRAM, _LIBRARY = rf"{_SYSTEM}\System32\whoami.exe", "kernel32.dll"
+else:
+    _READABLE, _WRITABLE = "/etc/hostname", "/tmp/pyodide-sandbox-test"
+    _PROGRAM, _LIBRARY = "true", "libc.so.6"
+
 ESCAPES = {
     "network": "await js.fetch('https://example.com')",
-    "read outside": "js.Deno.readTextFileSync('/etc/hostname')",
-    "write": "js.Deno.writeTextFileSync('/tmp/pyodide-sandbox-test', 'x')",
-    "env": "js.Deno.env.get('HOME')",
-    "subprocess": "js.Deno.Command.new('true').outputSync()",
-    "ffi": "js.Deno.dlopen('libc.so.6', js.Object.new())",
+    "read outside": f"js.Deno.readTextFileSync({_READABLE!r})",
+    "write": f"js.Deno.writeTextFileSync({_WRITABLE!r}, 'x')",
+    "env": "js.Deno.env.get('PATH')",
+    "subprocess": f"js.Deno.Command.new({_PROGRAM!r}).outputSync()",
+    "ffi": f"js.Deno.dlopen({_LIBRARY!r}, js.Object.new())",
 }
 
 

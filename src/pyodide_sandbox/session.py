@@ -4,9 +4,10 @@ The process is the boundary, not Pyodide: code in a cell can reach JavaScript, s
 everything worth protecting stays on this side. Deno runs with no network, write,
 subprocess, FFI or environment access, can read only its own files, the Pyodide
 files and the variable store, if any, and gets an environment without the host's
-secrets. A cell over its time limit gets the process SIGKILLed, since Python
-inside Pyodide can catch an interrupt and a long C call wouldn't see one. Every
-message from Deno is checked before use, as a cell can write to the pipe itself.
+secrets. A cell over its time limit gets the process killed (SIGKILL, or
+TerminateProcess on Windows), since Python inside Pyodide can catch an interrupt
+and a long C call wouldn't see one. Every message from Deno is checked before use,
+as a cell can write to the pipe itself.
 
 Not yet done (later phases): a memory limit (Pyodide 314.0.7 has no
 `maxMemoryBytes`; a cgroup is the plan), running as another user, seccomp.
@@ -172,8 +173,11 @@ class PyodideSession:
             stderr=subprocess.PIPE,
             # nothing from the host's environment (API keys, say) reaches the process
             env=_deno_env(),
-            # so a Ctrl-C in the host's terminal doesn't reach it
+            # so a Ctrl-C in the host's terminal doesn't reach it: a new session on
+            # POSIX, a new process group on Windows (where start_new_session is
+            # ignored)
             start_new_session=True,
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
         )
         weakref.finalize(self, _kill, self._proc)
         assert self._proc.stdout and self._proc.stderr

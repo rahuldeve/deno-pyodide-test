@@ -1,4 +1,4 @@
-"""The parts of the Pyodide distribution a session needs, downloaded on first use.
+r"""The parts of the Pyodide distribution a session needs, downloaded on first use.
 
 The full Pyodide release is 337 MB. A session needs only the runtime (about 14 MB)
 and the wheels of its packages and their dependencies (about 22 MB for numpy,
@@ -6,6 +6,7 @@ pandas, scipy and tzdata), so `ensure_distribution` downloads just those into a
 cache directory, from Pyodide's CDN by default:
 
     $PYODIDE_DIST_DIR, else $XDG_CACHE_HOME/pyodide-sandbox/<version>, else
+    %LOCALAPPDATA%\pyodide-sandbox\<version> on Windows, else
     ~/.cache/pyodide-sandbox/<version>
 
 Every file is checked before it is kept. The runtime's hashes are pinned here, and
@@ -19,15 +20,17 @@ package added later is downloaded then; nothing already there is fetched again.
 an image, so that sessions start without network access.
 """
 
-import fcntl
+import errno
 import hashlib
 import json
 import logging
 import os
 import re
+import sys
 import urllib.request
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -62,8 +65,10 @@ def default_dist_dir() -> Path:
     """`$PYODIDE_DIST_DIR`, else a per-version directory in the user's cache."""
     if configured := os.environ.get("PYODIDE_DIST_DIR"):
         return Path(configured)
-    cache = os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache"
-    return Path(cache) / "pyodide-sandbox" / PYODIDE_VERSION
+    cache = os.environ.get("XDG_CACHE_HOME")
+    if not cache and sys.platform == "win32":
+        cache = os.environ.get("LOCALAPPDATA")
+    return Path(cache or Path.home() / ".cache") / "pyodide-sandbox" / PYODIDE_VERSION
 
 
 def default_index_url() -> str:
@@ -100,14 +105,40 @@ def ensure_distribution(
         return root.resolve()
     try:
         root.mkdir(parents=True, exist_ok=True)
-        with (root / ".lock").open("w") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)  # another process may be downloading
+        with _locked(root / ".lock"):  # another process may be downloading
             base = index_url or default_index_url()
             _download_missing(root, base, {LOCK_FILE: CORE_FILES[LOCK_FILE]})
             _download_missing(root, base, _required(root, packages))
     except OSError as e:
         raise DistributionError(f"downloading Pyodide into {root} failed: {e}") from e
     return root.resolve()
+
+
+@contextmanager
+def _locked(path: Path) -> Iterator[None]:
+    """Hold an exclusive lock on the file `path`, waiting for other holders."""
+    with path.open("w") as file:
+        if sys.platform == "win32":
+            import msvcrt
+
+            while True:
+                try:
+                    # locks the first byte; LK_LOCK gives up after 10 s of trying
+                    msvcrt.locking(file.fileno(), msvcrt.LK_LOCK, 1)
+                    break
+                except OSError as e:
+                    if e.errno != errno.EDEADLK:
+                        raise
+            try:
+                yield
+            finally:
+                file.seek(0)
+                msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(file, fcntl.LOCK_EX)
+            yield  # released when the file is closed
 
 
 def import_names(
@@ -160,7 +191,8 @@ def _required(root: Path, packages: list[str]) -> dict[str, str]:
 
 def _read_lock(root: Path) -> dict[str, Any]:
     try:
-        packages = json.loads((root / LOCK_FILE).read_text())["packages"]
+        text = (root / LOCK_FILE).read_text(encoding="utf-8")
+        packages = json.loads(text)["packages"]
     except (OSError, ValueError, KeyError, TypeError) as e:
         raise DistributionError(f"can't read {root / LOCK_FILE}: {e}") from e
     return packages

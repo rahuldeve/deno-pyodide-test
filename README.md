@@ -22,8 +22,7 @@ agent = Agent("anthropic:claude-sonnet-5-5", capabilities=[repl])
 uv add "pyodide-sandbox @ git+ssh://…/pyodide-sandbox"   # or a path, or an index
 ```
 
-That is all the install there is, on Linux or macOS (not Windows: the download
-lock and the process handling are POSIX):
+That is all the install there is, on Linux, macOS or Windows:
 
 - **Deno** comes from the `deno` package on PyPI (pinned to 2.9.8), which ships the
   binary as a platform wheel. `$PYODIDE_SANDBOX_DENO` overrides it.
@@ -33,7 +32,8 @@ lock and the process handling are POSIX):
 - **Pyodide** is downloaded when the first session starts: the runtime (14 MB) and
   the wheels of `packages` with their dependencies (22 MB for the defaults), not the
   337 MB release. They go to `$PYODIDE_DIST_DIR`, else
-  `~/.cache/pyodide-sandbox/314.0.7` (`$XDG_CACHE_HOME` is respected), and later
+  `~/.cache/pyodide-sandbox/314.0.7` (`%LOCALAPPDATA%\pyodide-sandbox\314.0.7` on
+  Windows; `$XDG_CACHE_HOME` is respected), and later
   sessions use them offline. A package added later is downloaded then. The
   runtime's sha256s are pinned in `distribution.py`, and the pinned
   `pyodide-lock.json` holds every wheel's, so only the release's own files are kept.
@@ -80,7 +80,8 @@ uv run poe agent     # live demo, needs ANTHROPIC_API_KEY
 
 Deno runs with `--no-prompt --cached-only --no-remote --allow-read=<_deno>,<Pyodide files>,<store>`,
 so it has no network, write, subprocess, FFI or env access. It gets none of the host's
-environment variables. The time limit is a SIGKILL of the process, and the next cell
+environment variables. The time limit is a SIGKILL of the process (TerminateProcess
+on Windows), and the next cell
 starts a new process. If Pyodide itself fails for good (`os._exit`, or a JavaScript
 error inside one of its syscalls), `main.ts` reports the cause and exits, and the next
 cell starts a new process too. A JavaScript error that nothing catches but that
