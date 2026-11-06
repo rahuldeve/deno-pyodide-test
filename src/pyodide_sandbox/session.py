@@ -39,6 +39,7 @@ DEFAULT_PACKAGES = ("numpy", "pandas", "tzdata")
 # Limits on what Deno sends back; the in-sandbox cap on each stream is the real one
 _MAX_LINE_BYTES = 8 << 20
 _STDERR_TAIL_LINES = 50
+_MAX_FATAL_CHARS = 1000
 
 
 def default_deno() -> str:
@@ -242,6 +243,17 @@ class PyodideSession:
                 if tail and what == "boot":
                     why += f":\n{tail}"
                 raise self._die(SessionCrashed, why)
+            if message.get("op") == "fatal":
+                # main.ts exits after this; a cell could also forge one, which only
+                # ends its own session, as `Deno.exit` would
+                reason = message.get("message")
+                if not isinstance(reason, str):
+                    reason = "no reason given"
+                raise self._die(
+                    SessionCrashed,
+                    f"Pyodide failed during {what} and can't be used again: "
+                    f"{reason[:_MAX_FATAL_CHARS]}",
+                )
             if wanted(message):
                 return message
 

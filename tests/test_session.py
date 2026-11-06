@@ -6,6 +6,7 @@ from collections.abc import Iterator
 import pytest
 
 from pyodide_sandbox.session import (
+    DENO_DIR,
     PyodideSession,
     SessionCrashed,
     SessionTimeout,
@@ -227,6 +228,55 @@ def test_process_exit_is_a_crash(bare: PyodideSession) -> None:
     with pytest.raises(SessionCrashed, match="exited with code 3"):
         bare.run("import js\njs.Deno.exit(3)")
     assert not bare.alive
+
+
+@pytest.mark.parametrize(
+    ("code", "cause"),
+    [
+        (
+            "import pyodide_js, js\npyodide_js._api.fatal_error(js.Error.new('boom'))",
+            "Error: boom",
+        ),
+        # A JS error inside a syscall: Deno refuses the chmod on a NODEFS mount
+        (
+            (
+                "import pyodide_js, os\n"
+                f"pyodide_js.mountNodeFS('/mnt', {str(DENO_DIR)!r})\n"
+                "os.chmod('/mnt/main.ts', 0o777)"
+            ),
+            "NotCapable: Requires write access",
+        ),
+        ("import os\nos._exit(3)", "Exit: Program terminated with exit(3)"),
+    ],
+)
+def test_pyodide_failing_for_good_is_a_crash_with_its_cause(
+    bare: PyodideSession, code: str, cause: str
+) -> None:
+    # main.ts reports the cause and exits, rather than answer every later cell with
+    # an error from a Pyodide that can't run anything
+    with pytest.raises(SessionCrashed) as raised:
+        bare.run(code, timeout=10)
+    assert str(raised.value).startswith(
+        f"Pyodide failed during cell and can't be used again: {cause}"
+    )
+    assert not bare.alive
+
+
+def test_uncaught_js_errors_go_to_the_cell(bare: PyodideSession) -> None:
+    # Deno would exit on them, but Pyodide is fine, so the session goes on
+    throw = "js.Function.new('throw new Error(\"thrown\")')"
+    reject = "js.Function.new('return Promise.reject(new Error(\"rejected\"))')"
+    result = bare.run(
+        "import asyncio, js\nx = 1\n"
+        f"js.setTimeout({throw}, 0)\njs.setTimeout({reject}, 0)\n"
+        "await asyncio.sleep(0.2)"
+    )
+    assert result.error is None
+    assert result.stderr == (
+        "Uncaught JavaScript error: Error: thrown\n"
+        "Uncaught JavaScript error: Error: rejected\n"
+    )
+    assert bare.run("x").stdout == "1\n"
 
 
 def test_garbage_on_the_pipe_is_a_crash(bare: PyodideSession) -> None:

@@ -4,6 +4,8 @@
 //   deno -> host (stdout):  {"op": "ready", "boot_ms": ...} once, then per cell
 //                           {"id": 1, "error": null | "ZeroDivisionError",
 //                            "stdout": "...", "stderr": "...", "duration_ms": ...}
+//                           or, when Pyodide can't go on, {"op": "fatal", "message": "..."}
+//                           just before the process exits (code 70)
 //
 // Stdout carries nothing but these messages: console.log is sent to stderr, and so
 // is Pyodide's own output outside a cell. The host enforces the time limit by
@@ -29,6 +31,39 @@ console.info = console.error;
 
 async function send(message: unknown): Promise<void> {
   await stdoutWriter.write(encoder.encode(JSON.stringify(message) + "\n"));
+}
+
+/**
+ * Report why Pyodide can't go on, then exit, so the host starts a new process.
+ *
+ * Pyodide can fail for good, sometimes from inside a cell: a JS error thrown in a
+ * syscall does it, e.g. `os.chmod` on a NODEFS directory the cell mounted itself.
+ * Every call into it fails after that. Synchronous, so it can run inside Pyodide's
+ * fatal-error hook, before the follow-on errors that escape it.
+ */
+function die(cause: unknown): never {
+  const message = describe(cause);
+  console.error(`pyodide-sandbox: exiting: ${message}`);
+  try {
+    // a message's own writes are awaited before the next, so none is half done
+    const line = encoder.encode(
+      JSON.stringify({ op: "fatal", message }) + "\n",
+    );
+    for (let done = 0; done < line.length;) {
+      done += Deno.stdout.writeSync(line.subarray(done));
+    }
+  } catch {
+    // the host sees the exit anyway
+  }
+  Deno.exit(70);
+}
+
+function describe(cause: unknown): string {
+  const text = cause instanceof Error
+    ? `${cause.name}: ${cause.message}`
+    : String(cause);
+  const firstLine = text.split("\n", 1)[0];
+  return firstLine.length > 500 ? firstLine.slice(0, 500) + "..." : firstLine;
 }
 
 /** A cell's output stream, kept to `limit` bytes; what is dropped is counted. */
@@ -98,8 +133,36 @@ for (const pkg of args.packages) {
   pyodide.runPython(`import ${pkg}`); // so the first cell doesn't pay for it
 }
 
+// Private API: Pyodide calls it with the cause of a fatal error, then throws
+// (pyodide.asm.mjs, API.fatal_error). Without it, the listeners below still exit.
+// deno-lint-ignore no-explicit-any
+(pyodide as any)._api.on_fatal = die;
 const stdout = new Capture(args.maxOutputBytes);
 const stderr = new Capture(args.maxOutputBytes);
+
+// An error nothing caught, e.g. thrown by a JS callback a cell scheduled. Deno would
+// exit; if Pyodide is still usable, it goes to the running cell's stderr instead
+// (between cells, it is dropped with the rest of that output). After boot only:
+// until then, Deno's own report goes to stderr, which the host shows.
+function uncaught(event: Event, cause: unknown): void {
+  if (!pyodideUsable()) die(cause);
+  event.preventDefault();
+  stderr.write(
+    encoder.encode(`Uncaught JavaScript error: ${describe(cause)}\n`),
+  );
+}
+globalThis.addEventListener("error", (e) => uncaught(e, e.error ?? e.message));
+globalThis.addEventListener("unhandledrejection", (e) => uncaught(e, e.reason));
+
+function pyodideUsable(): boolean {
+  try {
+    // after a fatal error, Pyodide's public API throws on every access
+    pyodide.globals;
+    return true;
+  } catch {
+    return false;
+  }
+}
 pyodide.setStdout({ write: (b: Uint8Array) => stdout.write(b) });
 pyodide.setStderr({ write: (b: Uint8Array) => stderr.write(b) });
 
@@ -124,9 +187,9 @@ for await (const line of readLines(Deno.stdin.readable)) {
   try {
     error = (await runCell(request.code, request.id)) ?? null;
   } catch (e) {
-    // run_cell catches the cell's own exceptions, so this is the runtime failing
-    error = "RunnerError";
-    stderr.write(encoder.encode(`${e}\n`));
+    // run_cell catches all the cell's own exceptions, so this is Pyodide failing,
+    // and its state can't be trusted
+    die(e);
   }
   await send({
     id: request.id,

@@ -22,7 +22,7 @@ agent = Agent("anthropic:claude-sonnet-5-5", capabilities=[repl])
 # Deno 2.9.8 in ~/.deno/bin (found on PATH, or set PYODIDE_SANDBOX_DENO)
 uv sync
 uv run poe setup     # downloads the 337 MB Pyodide distribution (sha256-checked) and the npm package
-uv run poe test      # 105 tests, ~3 min; the sandbox ones skip without Deno or the distribution
+uv run poe test      # 109 tests, ~3 min; the sandbox ones skip without Deno or the distribution
 uv run poe agent     # live demo, needs ANTHROPIC_API_KEY
 ```
 
@@ -40,7 +40,10 @@ uv run poe agent     # live demo, needs ANTHROPIC_API_KEY
 Deno runs with `--no-prompt --cached-only --no-remote --allow-read=<deno dir>,<pyodide-dist>,<store>`,
 so it has no network, write, subprocess, FFI or env access. It gets none of the host's
 environment variables. The time limit is a SIGKILL of the process, and the next cell
-starts a new process.
+starts a new process. If Pyodide itself fails for good (`os._exit`, or a JavaScript
+error inside one of its syscalls), `main.ts` reports the cause and exits, and the next
+cell starts a new process too. A JavaScript error that nothing catches but that
+leaves Pyodide usable goes to the running cell's stderr, and the session goes on.
 
 Host variables are pickled on the host and unpickled in the sandbox, so the host pins
 numpy and pandas to the sandbox's versions. A class defined only on the host fails
