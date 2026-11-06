@@ -13,6 +13,7 @@ import json
 import pickle
 import warnings
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -20,7 +21,7 @@ import pandas as pd
 import pytest
 import scipy.sparse
 
-from pyodide_sandbox import variables
+from pyodide_sandbox import PyodideRepl, variables
 from pyodide_sandbox.distribution import SANDBOX_VERSIONS
 from pyodide_sandbox.session import DENO_DIR, PyodideSession, SessionCrashed
 from pyodide_sandbox.variables import VariableStore, VersionMismatchWarning
@@ -34,20 +35,19 @@ Host = host_module.Host
 
 
 def host_for(store: VariableStore) -> Any:
-    return Host(str(store.directory))
+    # in the sandbox, `read` goes through Deno
+    return Host(str(store.directory), lambda path: Path(path).read_bytes())
 
 
 def test_layout() -> None:
     with VariableStore({"x": 1, "data": {"a": [1, 2]}}) as store:
         root = store.directory
         view = json.loads((root / "view.json").read_text())
-        assert view["format"] == 1
-        assert list(view["entries"]) == ["x", "data"]
-        x = view["entries"]["x"]
+        assert list(view) == ["x", "data"]
+        x = view["x"]
         data = pickle.dumps(1)
         assert x == {
             "name": "x",
-            "version": 1,
             "codec": "pickle",
             "blob": hashlib.sha256(data).hexdigest(),
             "type": "int",
@@ -55,7 +55,6 @@ def test_layout() -> None:
         }
         assert (root / "blobs" / x["blob"]).read_bytes() == data
         assert sorted(p.name for p in root.iterdir()) == ["blobs", "view.json"]
-        assert not list(root.rglob(".*.tmp"))
 
 
 def test_passed_dict_is_copied() -> None:
@@ -168,9 +167,12 @@ def test_warns_when_pickled_by_another_version(
     ) as record:
         VariableStore({"x": [1], "arr": np.arange(3)}).close()
     assert [w.filename for w in record] == [__file__]
-    # also inside a container, and through pandas
-    with pytest.warns(VersionMismatchWarning, match="'data' was pickled with numpy"):
-        VariableStore({"data": {"arr": np.zeros(2)}}).close()
+    # also inside a container, and through PyodideRepl, still naming this file
+    with pytest.warns(
+        VersionMismatchWarning, match="'data' was pickled with numpy"
+    ) as record:
+        PyodideRepl(variables={"data": {"arr": np.zeros(2)}})
+    assert [w.filename for w in record] == [__file__]
 
 
 def test_no_warning_for_the_sandboxs_versions() -> None:
@@ -344,7 +346,8 @@ def test_plain_values(session: PyodideSession) -> None:
 
 def test_setup_leaves_only_host(session: PyodideSession) -> None:
     result = session.run(
-        "[n for n in ('Host', 'pickle', 'json', 'setup_host', 'js', 'read_file')"
+        "[n for n in ('Host', 'pickle', 'json', 'setup_host', 'js', '_from_arrow',"
+        " 'numpy', 'pandas', 'scipy', 'tzdata', 'pyarrow')"
         " if n in globals()], repr(host)"
     )
     assert result.stdout == (

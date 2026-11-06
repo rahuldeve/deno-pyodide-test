@@ -22,11 +22,14 @@ agent = Agent("anthropic:claude-sonnet-5-5", capabilities=[repl])
 uv add "pyodide-sandbox @ git+ssh://…/pyodide-sandbox"   # or a path, or an index
 ```
 
-That is all the install there is:
+That is all the install there is, on Linux or macOS (not Windows: the download
+lock and the process handling are POSIX):
 
 - **Deno** comes from the `deno` package on PyPI (pinned to 2.9.8), which ships the
-  binary as a platform wheel (Linux x86_64/aarch64, macOS, Windows).
-  `$PYODIDE_SANDBOX_DENO` overrides it.
+  binary as a platform wheel. `$PYODIDE_SANDBOX_DENO` overrides it.
+- **`packages`** are names from Pyodide's package list (`scikit-learn`, `pyyaml`);
+  their modules (`sklearn`, `yaml`) are imported at boot, as the lock file names
+  them.
 - **Pyodide** is downloaded when the first session starts: the runtime (14 MB) and
   the wheels of `packages` with their dependencies (22 MB for the defaults), not the
   337 MB release. They go to `$PYODIDE_DIST_DIR`, else
@@ -59,7 +62,7 @@ That is all the install there is:
 ```sh
 uv sync
 uv run poe fetch     # optional; the first session downloads the same files
-uv run poe test      # 123 tests, ~3.5 min; the sandbox ones skip without Deno
+uv run poe test      # 122 tests, ~3.5 min; the sandbox ones skip without Deno
 uv run poe agent     # live demo, needs ANTHROPIC_API_KEY
 ```
 
@@ -83,9 +86,8 @@ error inside one of its syscalls), `main.ts` reports the cause and exits, and th
 cell starts a new process too. A JavaScript error that nothing catches but that
 leaves Pyodide usable goes to the running cell's stderr, and the session goes on.
 
-Host variables are pickled on the host and unpickled in the sandbox, so numpy, pandas
-and scipy values need the sandbox's versions on the host (pinned in the dev
-dependencies here, warned about otherwise). A class defined only on the host fails
+Host values other than DataFrames and Series are pickled on the host and unpickled
+in the sandbox (see "Using it as a library"). A class defined only on the host fails
 when a cell reads it. The store isn't mounted into Pyodide's filesystem: `host` reads
 it with `Deno.readFileSync`. Through a NODEFS mount, a cell's `os.chmod` or `os.utime`
 reaches Deno, and Deno's refusal breaks Pyodide for good, even with the files

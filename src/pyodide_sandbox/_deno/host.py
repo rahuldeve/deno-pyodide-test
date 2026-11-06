@@ -3,20 +3,15 @@
 main.ts loads this into a namespace of its own and gives `__main__` one `Host`, whose
 `read` goes through Deno (see `runner.setup_host`). It uses only the standard
 library, and pyarrow for Arrow values, which the session loads when the store has
-any (imported on the first read, unless `import pandas` already did). Every access reads `view.json` again; the store never changes a file once
-written, so a read can't see a half-written one. Ported from eryx-test's
-`host_accessor.py`, without `host.tools` for now.
+any (imported on the first read, unless `import pandas` already did). Every access
+reads `view.json` again, so a store closed on the host fails the read. Ported from
+eryx-test's `host_accessor.py`, without `host.tools` for now.
 """
 
 import json
 import pickle
 from collections.abc import Callable, Iterator
 from typing import Any
-
-
-def read_file(path: str) -> bytes:
-    with open(path, "rb") as f:
-        return f.read()
 
 
 def _from_arrow(data: bytes, series: bool) -> Any:
@@ -40,12 +35,12 @@ class Host:
 
     __slots__ = ("_read", "_root")
 
-    def __init__(self, root: str, read: Callable[[str], bytes] = read_file) -> None:
+    def __init__(self, root: str, read: Callable[[str], bytes]) -> None:
         object.__setattr__(self, "_root", root)
         object.__setattr__(self, "_read", read)
 
     def _entries(self) -> dict[str, dict[str, Any]]:
-        return json.loads(self._read(f"{self._root}/view.json"))["entries"]
+        return json.loads(self._read(f"{self._root}/view.json"))
 
     def _entry(self, name: str) -> dict[str, Any]:
         entries = self._entries()
@@ -61,7 +56,7 @@ class Host:
             return pickle.loads(data)
         if codec in ("arrow", "arrow-series"):
             return _from_arrow(data, series=codec == "arrow-series")
-        raise ValueError(f"host variable {name!r} has unknown codec {entry['codec']!r}")
+        raise ValueError(f"host variable {name!r} has unknown codec {codec!r}")
 
     def __getitem__(self, name: str) -> Any:
         return self._load(name, self._entry(name))
@@ -78,7 +73,7 @@ class Host:
         return self._load(name, entry)
 
     def info(self, name: str) -> dict[str, Any]:
-        """The variable's entry: its type, size, version and how it is stored."""
+        """The variable's entry: its type, size and how it is stored."""
         return dict(self._entry(name))
 
     def __setattr__(self, name: str, value: Any) -> None:

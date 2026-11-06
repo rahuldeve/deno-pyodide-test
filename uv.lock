@@ -711,7 +711,6 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "deno" },
-    { name = "pydantic-ai-harness" },
     { name = "pydantic-ai-slim" },
 ]
 
@@ -726,6 +725,7 @@ dev = [
     { name = "pandas" },
     { name = "poethepoet" },
     { name = "pyarrow" },
+    { name = "pydantic-ai-harness" },
     { name = "pydantic-ai-slim", extra = ["anthropic"] },
     { name = "pytest" },
     { name = "ruff" },
@@ -736,7 +736,6 @@ dev = [
 requires-dist = [
     { name = "deno", specifier = "==2.9.8" },
     { name = "pyarrow", marker = "extra == 'arrow'" },
-    { name = "pydantic-ai-harness", specifier = ">=0.63.0" },
     { name = "pydantic-ai-slim", specifier = ">=2.63.0" },
 ]
 provides-extras = ["arrow"]
@@ -747,6 +746,7 @@ dev = [
     { name = "pandas", specifier = "==3.0.2" },
     { name = "poethepoet", specifier = ">=0.49.0" },
     { name = "pyarrow", specifier = ">=26" },
+    { name = "pydantic-ai-harness", specifier = ">=0.63.0" },
     { name = "pydantic-ai-slim", extras = ["anthropic"], specifier = ">=2.63.0" },
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "ruff", specifier = ">=0.17.3" },

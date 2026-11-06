@@ -4,9 +4,9 @@ The process is the boundary, not Pyodide: code in a cell can reach JavaScript, s
 everything worth protecting stays on this side. Deno runs with no network, write,
 subprocess, FFI or environment access, can read only its own files, the Pyodide
 files and the variable store, if any, and gets an environment without the host's
-secrets. A cell over its time limit gets the process SIGKILLed, since Python inside Pyodide can catch an
-interrupt and a long C call wouldn't see one. Every message from Deno is checked
-before use, as a cell can write to the pipe itself.
+secrets. A cell over its time limit gets the process SIGKILLed, since Python
+inside Pyodide can catch an interrupt and a long C call wouldn't see one. Every
+message from Deno is checked before use, as a cell can write to the pipe itself.
 
 Not yet done (later phases): a memory limit (Pyodide 314.0.7 has no
 `maxMemoryBytes`; a cgroup is the plan), running as another user, seccomp.
@@ -29,7 +29,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any
 
-from pyodide_sandbox.distribution import default_dist_dir, ensure_distribution
+from pyodide_sandbox.distribution import (
+    default_dist_dir,
+    ensure_distribution,
+    import_names,
+)
 from pyodide_sandbox.variables import VariableStore
 
 # main.ts and the Python it runs inside Pyodide, shipped in the package
@@ -94,9 +98,6 @@ class PyodideSession:
         store: VariableStore | None = None,
         download: bool = True,
     ) -> None:
-        for name in packages:
-            if not name.isidentifier():
-                raise ValueError(f"not a package name: {name!r}")
         self.packages = tuple(packages)
         self.deno = deno or default_deno()
         self.dist_dir = Path(dist_dir) if dist_dir else default_dist_dir()
@@ -110,8 +111,9 @@ class PyodideSession:
         self._next_id = 0
         self._dead: SessionError | None = None
 
-    def command(self) -> list[str]:
-        readable = [DENO_DIR, self.dist_dir.resolve()]
+    def _command(self, root: Path) -> list[str]:
+        """Deno's command line; `root` holds the Pyodide files, with the lock file."""
+        readable = [DENO_DIR, root]
         store = []
         if self.store is not None:
             readable.append(self.store.directory)
@@ -126,11 +128,13 @@ class PyodideSession:
             f"--allow-read={','.join(map(str, readable))}",
             str(DENO_DIR / "main.ts"),
             "--dist",
-            str(self.dist_dir.resolve()),
+            str(root),
+            # names checked against the lock file by ensure_distribution, which also
+            # supplies the modules (dotted identifiers)
             "--packages",
-            ",".join(self.packages),
-            "--load",
-            ",".join(self._load_only()),
+            ",".join([*self.packages, *self._load_only()]),
+            "--imports",
+            ",".join(import_names(self.packages, root)),
             "--max-output-bytes",
             str(self.max_output_bytes),
             *store,
@@ -156,10 +160,10 @@ class PyodideSession:
         """
         if self._proc is not None:
             raise RuntimeError("session already started")
-        ensure_distribution(
+        root = ensure_distribution(
             (*self.packages, *self._load_only()), self.dist_dir, download=self.download
         )
-        command = self.command()
+        command = self._command(root)
         start = time.perf_counter()
         self._proc = subprocess.Popen(
             command,

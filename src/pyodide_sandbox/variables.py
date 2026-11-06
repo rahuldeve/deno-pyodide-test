@@ -16,9 +16,9 @@ A pandas DataFrame or Series goes as an Arrow IPC stream when pyarrow is install
 on the host (codec `arrow` or `arrow-series`). Arrow's format doesn't depend on the
 pandas or pyarrow version, so the host can use any pandas; the sandbox reads it
 with its own pyarrow, which the session then loads (`sandbox_packages`; about 5 s
-more boot, as Pyodide compiles libarrow). Arrow keeps
-dtypes (tz-aware datetimes, categoricals, nullable and string dtypes), the index and
-column names, and `df.attrs`. A frame Arrow can't convert (an object column of mixed
+more boot, as Pyodide compiles libarrow). Arrow keeps dtypes (tz-aware datetimes,
+categoricals, nullable and string dtypes), the index and column names, and
+`df.attrs`. A frame Arrow can't convert (an object column of mixed
 types, duplicate column names), a subclass, or a Series whose name isn't a plain
 scalar is pickled instead.
 
@@ -35,11 +35,10 @@ instead (`Deno.readFileSync`), because Pyodide's NODEFS mount passes a cell's
 permission) breaks Pyodide for good. A refused read through Deno is an ordinary
 exception in the cell.
 
-Layout of the store's directory, ported from eryx-test's store (where it was a
-read-only mount, with a copy of the accessor):
+Layout of the store's directory, written in full before any session can read it:
 
-    view.json      {"format": 1, "epoch": 1, "entries": {name: entry}}
-    blobs/<hash>   one value's pickle, named by its sha256; never changed
+    view.json      {name: entry}, the fields of `Entry`
+    blobs/<hash>   one value's bytes, named by their sha256
 """
 
 import hashlib
@@ -62,8 +61,6 @@ from typing import Any, Self
 
 from pyodide_sandbox.distribution import SANDBOX_VERSIONS
 
-_FORMAT = 1
-
 
 class VersionMismatchWarning(UserWarning):
     """A value was pickled by another numpy, pandas or scipy than the sandbox has."""
@@ -74,7 +71,6 @@ class Entry:
     """One variable in the store, as the sandbox's `host.info(name)` also sees it."""
 
     name: str
-    version: int
     codec: str
     """How `blob` is decoded in the sandbox: `"pickle"`, `"arrow"` (a DataFrame) or
     `"arrow-series"`."""
@@ -129,16 +125,10 @@ class VariableStore:
         entries = {}
         for name, (data, codec, type_name) in encoded.items():
             digest = hashlib.sha256(data).hexdigest()
-            if not (blobs / digest).exists():
-                _atomic_write(blobs / digest, data)
-            entries[name] = Entry(name, 1, codec, digest, type_name, len(data))
-        view = {
-            "format": _FORMAT,
-            "epoch": 1,
-            "entries": {name: asdict(entry) for name, entry in entries.items()},
-        }
-        # Written last: the sandbox finds nothing until every blob is in place
-        _atomic_write(self._dir / "view.json", json.dumps(view, indent=1).encode())
+            (blobs / digest).write_bytes(data)
+            entries[name] = Entry(name, codec, digest, type_name, len(data))
+        view = {name: asdict(entry) for name, entry in entries.items()}
+        (self._dir / "view.json").write_text(json.dumps(view, indent=1))
         return entries
 
     @property
@@ -259,15 +249,28 @@ def _check_versions(name: str, modules: set[str]) -> None:
                 f"{module} {sandbox}, so it may not load there; pin "
                 f"{module}=={sandbox} on the host to be sure{hint}",
                 VersionMismatchWarning,
-                stacklevel=3,
+                stacklevel=_stacklevel_outside_package(),
             )
 
 
-def _atomic_write(path: pathlib.Path, data: bytes) -> None:
-    """Write `data` to `path` so that a reader sees either the old file or the new."""
-    tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
+# as code objects name their files
+_PACKAGE_DIR = os.path.dirname(__file__) + os.sep
+
+
+def _stacklevel_outside_package() -> int:
+    """The `stacklevel` of the caller's first caller outside this package.
+
+    So that a warning names the line that created the store, whether that was
+    `VariableStore(...)` or `PyodideRepl(variables=...)`, whose dataclass-made
+    `__init__` (file `<string>`) calls into the package too.
+    """
+    level, frame = 1, sys._getframe(1)
+    while frame is not None and (
+        frame.f_code.co_filename.startswith(_PACKAGE_DIR)
+        or (frame.f_code.co_filename, frame.f_code.co_name) == ("<string>", "__init__")
+    ):
+        level, frame = level + 1, frame.f_back
+    return level
 
 
 def _is_name(name: object) -> bool:

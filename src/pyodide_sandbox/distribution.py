@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 PYODIDE_VERSION = "314.0.7"
+PYTHON_VERSION = "3.14"  # the release's interpreter
 DEFAULT_INDEX_URL = f"https://cdn.jsdelivr.net/pyodide/v{PYODIDE_VERSION}/full/"
 LOCK_FILE = "pyodide-lock.json"
 # From the release's sha256-checked full archive (pyodide-314.0.7.tar.bz2)
@@ -109,6 +110,36 @@ def ensure_distribution(
     return root.resolve()
 
 
+def import_names(
+    packages: Iterable[str], dist_dir: str | Path | None = None
+) -> list[str]:
+    """The modules `packages` provide, from the lock file in `dist_dir`.
+
+    A package's name and its modules' can differ: `scikit-learn` is imported as
+    `sklearn`, `pyyaml` as `yaml`. A package not in the lock file raises `ValueError`.
+    """
+    root = Path(dist_dir) if dist_dir is not None else default_dist_dir()
+    lock = _read_lock(root)
+    names = []
+    for package in packages:
+        entry = lock.get(_canonical(package))
+        if entry is None:
+            raise ValueError(f"not in Pyodide {PYODIDE_VERSION}: {package}")
+        # a few entries list a distribution name rather than a module; skipped, as
+        # they can't be imported by that name anyway
+        names += [
+            m
+            for m in entry.get("imports", [])
+            if isinstance(m, str) and all(p.isidentifier() for p in m.split("."))
+        ]
+    return names
+
+
+def _canonical(name: str) -> str:
+    """A package name as the lock file has it (PEP 503): `PyYAML` is `pyyaml`."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
 def _missing(root: Path, packages: list[str]) -> set[str]:
     if not (root / LOCK_FILE).is_file():
         return {LOCK_FILE}
@@ -141,7 +172,7 @@ def _with_dependencies(lock: dict[str, Any], packages: list[str]) -> list[str]:
     unknown = []
 
     def visit(name: str) -> None:
-        key = name.lower()
+        key = _canonical(name)
         if key in found:
             return
         if key not in lock:

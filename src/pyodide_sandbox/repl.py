@@ -23,7 +23,8 @@ Compaction capabilities can be listed in any order relative to `PyodideRepl`.
         capabilities=[ClearToolResults(max_tokens=50_000), repl],
     )
 
-Ported from eryx-test's `EryxRepl`, without its `host.tools` and snapshots so far. See `pyodide_sandbox.session` for the process boundary.
+Ported from eryx-test's `EryxRepl`, without its `host.tools` and snapshots so far.
+See `pyodide_sandbox.session` for the process boundary.
 """
 
 import asyncio
@@ -40,6 +41,7 @@ from pydantic_ai.agent import AbstractAgent
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import InstructionChangePolicy, InstructionPart
 
+from pyodide_sandbox.distribution import PYTHON_VERSION
 from pyodide_sandbox.session import (
     DEFAULT_PACKAGES,
     PyodideSession,
@@ -77,8 +79,6 @@ Python arithmetic and `math` still raise as usual. Check computed values with \
 
 SCIPY_LINALG = """ `scipy.linalg`'s `inv`, `solve` and `cholesky` do raise \
 `LinAlgError`, so prefer them."""
-
-PYTHON_VERSION = "3.14"
 
 
 @dataclass
@@ -129,7 +129,8 @@ class PyodideRepl(AbstractCapability[Any]):
     """
 
     packages: Sequence[str] = DEFAULT_PACKAGES
-    """Pyodide packages loaded and imported when a session starts; each adds startup time."""
+    """Pyodide packages loaded and imported when a session starts, by their names in
+    Pyodide's package list (e.g. `scikit-learn`); each adds startup time."""
 
     _: KW_ONLY
 

@@ -13,11 +13,13 @@
 // isn't a security boundary: code in a cell can reach JavaScript (`import js`) and
 // write to the pipe itself, so the host treats every message as untrusted.
 //
-// Usage: deno run <flags> main.ts --dist DIR [--packages numpy,pandas] [--load pyarrow]
-//                                [--max-output-bytes N] [--store DIR]
+// Usage: deno run <flags> main.ts --dist DIR [--packages scikit-learn,pyarrow]
+//                                [--imports sklearn] [--max-output-bytes N] [--store DIR]
 //
-// --packages are loaded and imported; --load ones only loaded, for a cell or `host`
-// to import when needed.
+// --packages are loaded; --imports are imported at boot, so the first cell doesn't
+// pay for them. The host passes the modules of the packages it was asked for (from
+// the lock file: a package's name isn't always its module's), not of those only
+// `host` needs (pyarrow), which are imported when needed.
 //
 // With --store, cells read the host's variables in DIR as `host.NAME` (runner.setup_host).
 
@@ -31,9 +33,12 @@ const { loadPyodide } = await import(
 const encoder = new TextEncoder();
 const stdoutWriter = Deno.stdout.writable.getWriter();
 
-// Anything printed with console.log (Pyodide's own messages, say) would corrupt the protocol
-console.log = console.error;
-console.info = console.error;
+// Anything printed to stdout (Pyodide's own messages, say) would corrupt the
+// protocol, so the console's printing methods go to stderr. (count, timeLog and
+// timeEnd still print to stdout, like a cell writing to the pipe itself.)
+for (const name of ["log", "info", "debug", "dir", "dirxml", "table"] as const) {
+  console[name] = console.error;
+}
 
 async function send(message: unknown): Promise<void> {
   await stdoutWriter.write(encoder.encode(JSON.stringify(message) + "\n"));
@@ -113,9 +118,8 @@ const pyodide = await loadPyodide({
   stdout: (msg: string) => console.error(msg),
   stderr: (msg: string) => console.error(msg),
 });
-const toLoad = [...args.packages, ...args.load];
-if (toLoad.length) {
-  await pyodide.loadPackage(toLoad, {
+if (args.packages.length) {
+  await pyodide.loadPackage(args.packages, {
     messageCallback: () => {},
     errorCallback: (msg: string) => console.error(msg),
   });
@@ -136,8 +140,11 @@ if (args.store) {
   );
   runnerNamespace.get("setup_host")(hostSource, args.store);
 }
-for (const pkg of args.packages) {
-  pyodide.runPython(`import ${pkg}`); // so the first cell doesn't pay for it
+for (const module of args.imports) {
+  // not in __main__: a cell that uses `numpy` without importing it should fail
+  pyodide.runPython(`import ${module}`, {
+    globals: pyodide.globals.get("dict")(),
+  });
 }
 
 // Private API: Pyodide calls it with the cause of a fatal error, then throws
@@ -177,15 +184,7 @@ await send({ op: "ready", boot_ms: performance.now() - t0 });
 
 for await (const line of readLines(Deno.stdin.readable)) {
   if (!line.trim()) continue;
-  const request = JSON.parse(line);
-  if (request.op !== "run") {
-    await send({
-      id: request.id,
-      op: "error",
-      message: `unknown op ${request.op}`,
-    });
-    continue;
-  }
+  const request = JSON.parse(line); // the host only sends {"op": "run"}
   // Output written between cells (by a task a cell left running) is not this cell's
   stdout.take();
   stderr.take();
@@ -226,7 +225,7 @@ function parseArgs(argv: string[]) {
   const options = {
     dist: "",
     packages: [] as string[],
-    load: [] as string[],
+    imports: [] as string[],
     maxOutputBytes: 1 << 20,
     store: "",
   };
@@ -241,8 +240,8 @@ function parseArgs(argv: string[]) {
         options.packages = value.split(",").filter(Boolean);
         i++;
         break;
-      case "--load":
-        options.load = value.split(",").filter(Boolean);
+      case "--imports":
+        options.imports = value.split(",").filter(Boolean);
         i++;
         break;
       case "--store":

@@ -1,14 +1,13 @@
 """The Pyodide REPL capability, driven by a scripted model (no API key needed).
 
-Ported from eryx-test's tests/test_pydantic_capability.py. Most tests load no
-packages, so each session boots in about 2 s instead of 6.
+Ported from eryx-test's tests/test_pydantic_capability.py. The tests load no
+packages, so each session boots in about 2 s instead of 8.
 """
 
 import asyncio
 import copy
 import dataclasses
 import gc
-import pickle
 import warnings
 from collections.abc import Callable, Iterator
 from typing import Any
@@ -163,13 +162,9 @@ def test_instructions_describe_the_sandbox() -> None:
     assert "scipy" not in no_scipy
 
 
-def test_instructions_index_no_cells() -> None:
-    repl = PyodideRepl((), index_cells=0)
+def test_instructions_index_no_cells(make_repl: Callable[..., PyodideRepl]) -> None:
     script = Script(run_cells("x = 1", "x"))
-    try:
-        make_agent(repl, script).run_sync("go")
-    finally:
-        repl.close()
+    make_agent(make_repl(index_cells=0), script).run_sync("go")
 
     _, info = script.requests[-1]
     assert info.instructions is not None
@@ -248,15 +243,11 @@ def test_clearing_in_any_order(repl: PyodideRepl, clear_first: bool) -> None:
     assert "Cells run so far:\n1 ok: print('one')" in info.instructions
 
 
-def test_append_instructions() -> None:
-    repl = PyodideRepl((), on_change="append")
+def test_append_instructions(make_repl: Callable[..., PyodideRepl]) -> None:
     script = Script(run_cells("x = 1", "y = 2"))
-    try:
-        with warnings.catch_warnings():
-            warnings.filterwarnings("error", message="Instruction block")
-            make_agent(repl, script).run_sync("go")
-    finally:
-        repl.close()
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message="Instruction block")
+        make_agent(make_repl(on_change="append"), script).run_sync("go")
 
     messages, info = script.requests[-1]
     # the prompt prefix keeps the index as it was when the run started
@@ -464,21 +455,6 @@ def test_copies_keep_the_store() -> None:
     assert dataclasses.replace(repl).store is repl.store
 
 
-@pytest.mark.parametrize(
-    ("variables", "error"),
-    [
-        ({"not-a-name": 1}, ValueError),
-        ({"class": 1}, ValueError),
-        ({"f": lambda: 0}, (pickle.PicklingError, AttributeError)),
-    ],
-)
-def test_bad_variables_fail_at_construction(
-    variables: dict[str, object], error: type[Exception]
-) -> None:
-    with pytest.raises(error):
-        PyodideRepl(variables=variables)
-
-
 def test_variable_the_sandbox_cannot_load(
     make_repl: Callable[..., PyodideRepl],
 ) -> None:
@@ -559,32 +535,3 @@ def test_rebinds_after_agent_is_gone(repl: PyodideRepl) -> None:
     gc.collect()
     make_agent(repl, Script(run_cells("1 + 1"))).run_sync("go")
     assert repl.cells[0].stdout == "2\n"
-
-
-def test_numpy_and_pandas() -> None:
-    import pandas as pd
-
-    rain = pd.DataFrame(
-        {
-            "city": ["a", "b", "a"],
-            "rain": [1.0, 2.5, 3.0],
-            "day": pd.date_range("2026-01-01", periods=3, tz="Europe/Oslo"),
-        }
-    )
-    repl = PyodideRepl(variables={"rain": rain})
-    try:
-        script = Script(
-            run_cells(
-                "import pandas as pd\n"
-                "df = pd.DataFrame({'city': ['a', 'b', 'a'], 'rain': [1.0, 2.5, 3.0]})",
-                "df.groupby('city').rain.sum().to_dict()",
-                "r = host.rain\nr.equals(df.assign(day=r.day)), str(r.day.dt.tz)",
-            )
-        )
-        make_agent(repl, script).run_sync("go")
-        _, local, from_host = repl.cells
-        assert local.stdout == "{'a': 4.0, 'b': 2.5}\n"
-        assert from_host.stdout == "(True, 'Europe/Oslo')\n"
-        assert "Host variables (read-only): rain (DataFrame)." in instructions(script)
-    finally:
-        repl.close()

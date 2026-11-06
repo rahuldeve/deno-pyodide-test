@@ -183,6 +183,26 @@ def test_background_task_output_is_not_the_next_cells(bare: PyodideSession) -> N
     assert bare.run("print('now')").stdout == "now\n"
 
 
+def test_console_output_stays_off_the_protocol(bare: PyodideSession) -> None:
+    # Deno prints these to stdout, which carries only the protocol's messages
+    calls = ["log", "info", "debug", "dir", "dirxml", "table", "group", "trace"]
+    code = "import js\n" + "\n".join(f"js.console.{c}('x')" for c in calls)
+    result = bare.run(code + "\nNone")
+    assert (result.error, result.stdout) == (None, ""), result.stderr
+    assert bare.run("1 + 1").stdout == "2\n"
+
+
+def test_packages_are_imported_by_their_modules_names() -> None:
+    # python-dateutil's module is `dateutil`; names are matched as pip does
+    session = PyodideSession(("Python_DateUtil",))
+    session.start()
+    try:
+        result = session.run("import sys\n'dateutil' in sys.modules")
+        assert (result.error, result.stdout) == (None, "True\n")
+    finally:
+        session.close()
+
+
 def test_cell_ids_must_increase(bare: PyodideSession) -> None:
     bare.run("1", cell_id=5)
     with pytest.raises(ValueError, match="cell_id"):
@@ -250,8 +270,6 @@ def test_deno_permissions_refuse(bare: PyodideSession, what: str) -> None:
 def test_python_file_access_stays_in_pyodides_memory_fs(bare: PyodideSession) -> None:
     # Emscripten's in-memory filesystem, not the host's: even files Deno may read
     # aren't mounted
-    from pyodide_sandbox.session import DENO_DIR
-
     result = bare.run(
         "import os\nopen('/tmp/x', 'w').write('hi')\n"
         f"os.path.exists('/etc/hostname'), os.path.exists({str(DENO_DIR / 'main.ts')!r})"

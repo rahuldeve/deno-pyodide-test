@@ -16,6 +16,7 @@ from pyodide_sandbox.distribution import (
     SANDBOX_VERSIONS,
     DistributionError,
     ensure_distribution,
+    import_names,
 )
 from pyodide_sandbox.session import DEFAULT_PACKAGES
 
@@ -98,6 +99,21 @@ def test_missing_files_without_download(tmp_path: Path, mirror: str) -> None:
     ensure_distribution([], tmp_path, index_url=mirror)
     with pytest.raises(DistributionError, match=f"missing from .*: {NUMPY};"):
         ensure_distribution(["numpy"], tmp_path, download=False)
+
+
+def test_import_names(cache: Path) -> None:
+    assert import_names(
+        ["scikit-learn", "PyYAML", "python_dateutil", "numpy"], cache
+    ) == [
+        "sklearn",
+        "_yaml",
+        "yaml",
+        "dateutil",
+        "numpy",
+    ]
+    assert import_names(["libopenblas"], cache) == []  # a shared library: no modules
+    with pytest.raises(ValueError, match="not in Pyodide 314.0.7: nope"):
+        import_names(["nope"], cache)
 
 
 def test_sandbox_versions_match_the_lock_file(cache: Path) -> None:
