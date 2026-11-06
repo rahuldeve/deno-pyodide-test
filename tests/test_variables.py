@@ -4,9 +4,11 @@ Ported from eryx-test's tests/test_variables.py.
 """
 
 import datetime
+import decimal
 import gc
 import hashlib
 import importlib.util
+import inspect
 import json
 import pickle
 import warnings
@@ -18,11 +20,12 @@ import pandas as pd
 import pytest
 import scipy.sparse
 
+from pyodide_sandbox import variables
 from pyodide_sandbox.distribution import SANDBOX_VERSIONS
 from pyodide_sandbox.session import DENO_DIR, PyodideSession, SessionCrashed
 from pyodide_sandbox.variables import VariableStore, VersionMismatchWarning
 
-# deno/host.py runs in the sandbox, but only needs the standard library
+# _deno/host.py runs in the sandbox; it needs only the standard library (and pyarrow)
 _spec = importlib.util.spec_from_file_location("pyodide_host", DENO_DIR / "host.py")
 assert _spec and _spec.loader
 host_module = importlib.util.module_from_spec(_spec)
@@ -167,7 +170,7 @@ def test_warns_when_pickled_by_another_version(
     assert [w.filename for w in record] == [__file__]
     # also inside a container, and through pandas
     with pytest.warns(VersionMismatchWarning, match="'data' was pickled with numpy"):
-        VariableStore({"data": {"df": pd.DataFrame({"a": [1]})}}).close()
+        VariableStore({"data": {"arr": np.zeros(2)}}).close()
 
 
 def test_no_warning_for_the_sandboxs_versions() -> None:
@@ -176,6 +179,85 @@ def test_no_warning_for_the_sandboxs_versions() -> None:
         VariableStore(
             {"arr": np.arange(3), "df": weather(), "s": scipy.sparse.eye_array(2)}
         ).close()
+
+
+class SubFrame(pd.DataFrame):
+    pass
+
+
+def frames() -> dict[str, Any]:
+    """Values that go as Arrow, and some that can't and are pickled instead."""
+    df = weather()
+    df.attrs["unit"] = "C"
+    return {
+        "df": df,
+        "dtypes": pd.DataFrame(
+            {
+                "td": pd.to_timedelta([1, 2], unit="s"),
+                "period": pd.period_range("2026-01", periods=2, freq="M"),
+                "interval": pd.interval_range(0, 2),
+                "boolean": pd.array([True, None], dtype="boolean"),
+                "float32": np.float32([1, 2]),
+                "decimal": [decimal.Decimal("1.10"), None],
+                "bytes": [b"x", b"y"],
+                "naive": pd.to_datetime(["2026-01-01", None]),
+            }
+        ),
+        "int_columns": pd.DataFrame({0: [1, 2], 1: [3.5, 4.5]}),
+        "multi": pd.DataFrame(
+            [[1, 2], [3, 4]],
+            columns=pd.MultiIndex.from_tuples([("a", "x"), ("a", "y")]),
+            index=pd.MultiIndex.from_tuples([("k", 1), ("k", 2)], names=["g", "n"]),
+        ),
+        "empty": pd.DataFrame(),
+        "series": pd.Series([1.5, None], name="temp"),
+        "unnamed": pd.Series([1, 2]),
+        "int_named": pd.Series(["a", "b"], name=7, dtype="category"),
+        # pickled
+        "mixed": pd.DataFrame({"m": [1, "a"]}),
+        "duplicates": pd.DataFrame([[1, 2]], columns=["a", "a"]),
+        "tuple_named": pd.Series([1], name=("a", "b")),
+        "subclass": SubFrame({"a": [1]}),
+    }
+
+
+PICKLED = {"mixed", "duplicates", "tuple_named", "subclass"}
+
+
+def describe(value: Any) -> str:
+    """What must survive the trip: values, dtypes, index, names and attrs."""
+    dtypes = value.dtypes.astype(str).to_dict() if value.ndim == 2 else value.dtype
+    return f"{type(value).__name__}|{value!r}|{dtypes}|{value.attrs}"
+
+
+def test_dataframes_go_as_arrow() -> None:
+    values = frames()
+    with VariableStore(values) as store:
+        assert {n: store.info(n).codec for n in values} == {
+            n: "pickle"
+            if n in PICKLED
+            else "arrow-series"
+            if isinstance(v, pd.Series)
+            else "arrow"
+            for n, v in values.items()
+        }
+        assert store.sandbox_packages == ("pyarrow",)
+        host = host_for(store)
+        for name, value in values.items():
+            assert describe(host[name]) == describe(value), name
+        assert type(host.subclass) is SubFrame
+
+
+def test_without_pyarrow_dataframes_are_pickled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(variables, "_pyarrow", lambda: None)
+    with VariableStore({"df": weather(), "x": 1}) as store:
+        assert store.info("df").codec == "pickle"
+        assert store.sandbox_packages == ()
+    monkeypatch.setitem(SANDBOX_VERSIONS, "pandas", "0.0")
+    with pytest.warns(VersionMismatchWarning, match="or install pyarrow"):
+        VariableStore({"df": weather()}).close()
 
 
 def test_host_is_read_only() -> None:
@@ -304,6 +386,29 @@ def test_store_cannot_be_changed(
     assert (store.directory / "view.json").read_bytes() == before
     assert session.alive
     assert session.run("host.x").stdout == "1\n"
+
+
+def test_arrow_values_in_a_session_without_pandas() -> None:
+    # pyarrow, and the pandas and numpy it needs, are loaded for the store, and
+    # imported on the first read; the values come back as they were on the host
+    values = frames()
+    del values["subclass"]  # a class defined only on the host
+    with VariableStore(values) as store:
+        session = PyodideSession((), store=store)
+        session.start()
+        try:
+            result = session.run(
+                "import sys\n"
+                "before = 'pyarrow' in sys.modules\n"
+                f"{inspect.getsource(describe)}\n"
+                "described = {n: describe(host[n]) for n in host}\n"
+                "before, 'pyarrow' in sys.modules, described"
+            )
+            assert result.error is None, result.stderr
+            described = {n: describe(v) for n, v in values.items()}
+            assert result.stdout == repr((False, True, described)) + "\n"
+        finally:
+            session.close()
 
 
 def test_store_closed_before_the_session_starts() -> None:

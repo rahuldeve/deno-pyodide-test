@@ -12,6 +12,10 @@ dependencies = [
     "deno==2.9.8",
 ]
 
+[project.optional-dependencies]
+# DataFrames and Series go to the sandbox as Arrow, whatever the host's pandas version
+arrow = ["pyarrow"]
+
 [build-system]
 requires = ["uv_build>=0.11.8,<0.12"]
 build-backend = "uv_build"
@@ -29,6 +33,7 @@ dev = [
     "poethepoet>=0.49.0",
     "pytest>=9.1.1",
     "ruff>=0.17.3",
+    "pyarrow>=26",
 ]
 
 [tool.poe.tasks]

@@ -129,10 +129,17 @@ class PyodideSession:
             str(self.dist_dir.resolve()),
             "--packages",
             ",".join(self.packages),
+            "--load",
+            ",".join(self._load_only()),
             "--max-output-bytes",
             str(self.max_output_bytes),
             *store,
         ]
+
+    def _load_only(self) -> list[str]:
+        """Packages the store needs, loaded but not imported at boot (pyarrow)."""
+        needed = self.store.sandbox_packages if self.store is not None else ()
+        return [p for p in needed if p not in self.packages]
 
     @property
     def alive(self) -> bool:
@@ -149,7 +156,9 @@ class PyodideSession:
         """
         if self._proc is not None:
             raise RuntimeError("session already started")
-        ensure_distribution(self.packages, self.dist_dir, download=self.download)
+        ensure_distribution(
+            (*self.packages, *self._load_only()), self.dist_dir, download=self.download
+        )
         command = self.command()
         start = time.perf_counter()
         self._proc = subprocess.Popen(

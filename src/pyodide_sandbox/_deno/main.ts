@@ -13,8 +13,11 @@
 // isn't a security boundary: code in a cell can reach JavaScript (`import js`) and
 // write to the pipe itself, so the host treats every message as untrusted.
 //
-// Usage: deno run <flags> main.ts --dist DIR [--packages numpy,pandas] [--max-output-bytes N]
-//                                [--store DIR]
+// Usage: deno run <flags> main.ts --dist DIR [--packages numpy,pandas] [--load pyarrow]
+//                                [--max-output-bytes N] [--store DIR]
+//
+// --packages are loaded and imported; --load ones only loaded, for a cell or `host`
+// to import when needed.
 //
 // With --store, cells read the host's variables in DIR as `host.NAME` (runner.setup_host).
 
@@ -110,8 +113,9 @@ const pyodide = await loadPyodide({
   stdout: (msg: string) => console.error(msg),
   stderr: (msg: string) => console.error(msg),
 });
-if (args.packages.length) {
-  await pyodide.loadPackage(args.packages, {
+const toLoad = [...args.packages, ...args.load];
+if (toLoad.length) {
+  await pyodide.loadPackage(toLoad, {
     messageCallback: () => {},
     errorCallback: (msg: string) => console.error(msg),
   });
@@ -222,6 +226,7 @@ function parseArgs(argv: string[]) {
   const options = {
     dist: "",
     packages: [] as string[],
+    load: [] as string[],
     maxOutputBytes: 1 << 20,
     store: "",
   };
@@ -234,6 +239,10 @@ function parseArgs(argv: string[]) {
         break;
       case "--packages":
         options.packages = value.split(",").filter(Boolean);
+        i++;
+        break;
+      case "--load":
+        options.load = value.split(",").filter(Boolean);
         i++;
         break;
       case "--store":

@@ -9,8 +9,20 @@ session given the store lets Deno read that directory (and only read it), and de
         session.start()
         session.run("len(host.df)")
 
-Every read unpickles the file again, so it returns a fresh copy. The store can't be
-changed after it is created. Unpickling in the sandbox is safe for the host. It needs
+Every read decodes the file again, so it returns a fresh copy. The store can't be
+changed after it is created.
+
+A pandas DataFrame or Series goes as an Arrow IPC stream when pyarrow is installed
+on the host (codec `arrow` or `arrow-series`). Arrow's format doesn't depend on the
+pandas or pyarrow version, so the host can use any pandas; the sandbox reads it
+with its own pyarrow, which the session then loads (`sandbox_packages`; about 5 s
+more boot, as Pyodide compiles libarrow). Arrow keeps
+dtypes (tz-aware datetimes, categoricals, nullable and string dtypes), the index and
+column names, and `df.attrs`. A frame Arrow can't convert (an object column of mixed
+types, duplicate column names), a subclass, or a Series whose name isn't a plain
+scalar is pickled instead.
+
+Everything else is pickled. Unpickling in the sandbox is safe for the host. It needs
 the values' modules in the sandbox and can't load classes defined only on the host.
 A numpy, pandas or scipy object pickled by another version than the sandbox's
 (`distribution.SANDBOX_VERSIONS`) may not load there, so the store warns
@@ -64,7 +76,8 @@ class Entry:
     name: str
     version: int
     codec: str
-    """How `blob` is decoded in the sandbox: `"pickle"`."""
+    """How `blob` is decoded in the sandbox: `"pickle"`, `"arrow"` (a DataFrame) or
+    `"arrow-series"`."""
     blob: str
     """The sha256 of the stored bytes, which is also their file name."""
     type: str
@@ -86,10 +99,14 @@ class VariableStore:
         bad = [n for n in values if not _is_name(n)]
         if bad:
             raise ValueError(f"variable names must be Python identifiers: {bad}")
-        pickled = {}
+        encoded = {}
         for name, value in values.items():
-            pickled[name], modules = _pickle(value)
-            _check_versions(name, modules)
+            arrow = _to_arrow(value)
+            if arrow is None:
+                data, modules = _pickle(value)
+                _check_versions(name, modules)
+                arrow = (data, "pickle")
+            encoded[name] = arrow
         # resolved, as Deno's --allow-read compares real paths
         self._dir = pathlib.Path(tempfile.mkdtemp(prefix="pyodide-store-")).resolve()
         self._finalizer = weakref.finalize(
@@ -98,23 +115,23 @@ class VariableStore:
         try:
             self._entries = self._write(
                 {
-                    name: (data, type(values[name]).__name__)
-                    for name, data in pickled.items()
+                    name: (data, codec, type(values[name]).__name__)
+                    for name, (data, codec) in encoded.items()
                 }
             )
         except BaseException:
             self._finalizer()
             raise
 
-    def _write(self, pickled: dict[str, tuple[bytes, str]]) -> dict[str, Entry]:
+    def _write(self, encoded: dict[str, tuple[bytes, str, str]]) -> dict[str, Entry]:
         blobs = self._dir / "blobs"
         blobs.mkdir()
         entries = {}
-        for name, (data, type_name) in pickled.items():
+        for name, (data, codec, type_name) in encoded.items():
             digest = hashlib.sha256(data).hexdigest()
             if not (blobs / digest).exists():
                 _atomic_write(blobs / digest, data)
-            entries[name] = Entry(name, 1, "pickle", digest, type_name, len(data))
+            entries[name] = Entry(name, 1, codec, digest, type_name, len(data))
         view = {
             "format": _FORMAT,
             "epoch": 1,
@@ -128,6 +145,13 @@ class VariableStore:
     def directory(self) -> pathlib.Path:
         """Where the store is; a session gives Deno read access to it."""
         return self._dir
+
+    @property
+    def sandbox_packages(self) -> tuple[str, ...]:
+        """Pyodide packages the sandbox needs to decode the values: pyarrow for Arrow."""
+        if any(e.codec.startswith("arrow") for e in self._entries.values()):
+            return ("pyarrow",)
+        return ()
 
     def names(self) -> list[str]:
         """The variables' names, in the order they were given."""
@@ -156,6 +180,49 @@ class VariableStore:
         return f"VariableStore({listed})"
 
 
+_ARROW_METADATA = b"pyodide_sandbox"
+_SERIES_COLUMN = "values"
+
+
+def _pyarrow() -> types.ModuleType | None:
+    """pyarrow, if the host has it (the `arrow` extra)."""
+    try:
+        import pyarrow
+    except ImportError:
+        return None
+    return pyarrow
+
+
+def _to_arrow(value: Any) -> tuple[bytes, str] | None:
+    """A DataFrame or Series as an Arrow IPC stream and its codec, else None."""
+    pandas = sys.modules.get("pandas")
+    # exact types: a subclass (a GeoDataFrame, say) would come back as its base
+    if pandas is None or type(value) not in (pandas.DataFrame, pandas.Series):
+        return None
+    pa = _pyarrow()
+    if pa is None:
+        return None
+    if type(value) is pandas.Series:
+        if not isinstance(value.name, (str, int, float, bool, type(None))):
+            return None
+        frame, codec = value.to_frame(_SERIES_COLUMN), "arrow-series"
+        extra = {"name": value.name}
+    else:
+        frame, codec, extra = value, "arrow", {}
+    try:
+        table = pa.Table.from_pandas(frame)
+    except (pa.ArrowException, TypeError, ValueError):
+        return None
+    if extra:
+        metadata = {**(table.schema.metadata or {})}
+        metadata[_ARROW_METADATA] = json.dumps(extra).encode()
+        table = table.replace_schema_metadata(metadata)
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, table.schema) as writer:
+        writer.write_table(table)
+    return sink.getvalue().to_pybytes(), codec
+
+
 class _Pickler(pickle.Pickler):
     """Records the top-level modules of the classes and functions it pickles."""
 
@@ -182,10 +249,15 @@ def _check_versions(name: str, modules: set[str]) -> None:
         host = getattr(sys.modules.get(module), "__version__", None)
         sandbox = SANDBOX_VERSIONS[module]
         if host != sandbox:
+            hint = (
+                " (or install pyarrow, so that DataFrames go as Arrow)"
+                if module == "pandas" and _pyarrow() is None
+                else ""
+            )
             warnings.warn(
                 f"{name!r} was pickled with {module} {host} but the sandbox has "
                 f"{module} {sandbox}, so it may not load there; pin "
-                f"{module}=={sandbox} on the host to be sure",
+                f"{module}=={sandbox} on the host to be sure{hint}",
                 VersionMismatchWarning,
                 stacklevel=3,
             )

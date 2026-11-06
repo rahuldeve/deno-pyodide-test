@@ -43,16 +43,23 @@ That is all the install there is:
   need the network, run `python -m pyodide_sandbox fetch [PACKAGE ...] [--dir DIR]`
   and set `PyodideRepl(download=False)`. Then a missing file fails the start
   instead.
-- **Host values** pickled by numpy, pandas or scipy load reliably only with the
-  sandbox's versions (`SANDBOX_VERSIONS`). The library doesn't pin them on the host;
-  a `VersionMismatchWarning` names the value and the version to pin.
+- **Host DataFrames and Series** go to the sandbox as Arrow IPC when the host has
+  pyarrow (`pyodide-sandbox[arrow]`), so any host pandas works. They keep their
+  dtypes, index, column names and `attrs`. The sandbox reads them with Pyodide's
+  pyarrow 22, which is downloaded (10 MB) and loaded only for a store that holds
+  one.
+- **Other host values** are pickled. numpy, pandas or scipy objects load reliably
+  only with the sandbox's versions (`SANDBOX_VERSIONS`), so a
+  `VersionMismatchWarning` names the value and the version to pin. This also covers
+  a frame that Arrow can't convert (mixed-type object columns, duplicate column
+  names), a DataFrame subclass, and any frame when the host has no pyarrow.
 
 ## Developing
 
 ```sh
 uv sync
 uv run poe fetch     # optional; the first session downloads the same files
-uv run poe test      # 120 tests, ~3.5 min; the sandbox ones skip without Deno
+uv run poe test      # 123 tests, ~3.5 min; the sandbox ones skip without Deno
 uv run poe agent     # live demo, needs ANTHROPIC_API_KEY
 ```
 
@@ -62,7 +69,7 @@ uv run poe agent     # live demo, needs ANTHROPIC_API_KEY
 |---|---|
 | `src/pyodide_sandbox/repl.py` | `PyodideRepl`: `run_code`, `repl_history`, the cell index in the instructions, restart on timeout or crash |
 | `src/pyodide_sandbox/session.py` | `PyodideSession`: starts and kills the Deno process, speaks JSON lines, checks every reply |
-| `src/pyodide_sandbox/variables.py` | `VariableStore`: host values pickled into a temporary directory that only the session's Deno can read, and only read |
+| `src/pyodide_sandbox/variables.py` | `VariableStore`: host values (DataFrames as Arrow, the rest pickled) in a temporary directory that only the session's Deno can read, and only read |
 | `src/pyodide_sandbox/distribution.py` | Downloads and checks the Pyodide files the packages need; `python -m pyodide_sandbox fetch` |
 | `src/pyodide_sandbox/_deno/main.ts` | Imports Pyodide from those files (no npm), loads it and the packages, captures each cell's stdout and stderr (including C-level writes), caps them at 1 MB |
 | `src/pyodide_sandbox/_deno/runner.py` | Runs a cell in Pyodide: `CodeRunner` as `<cell-N>`, echoes the last expression's `repr`, trims tracebacks to the cell's frames |
@@ -98,6 +105,7 @@ exception in the cell.
 | `maxMemoryBytes` | Not in the 314.0.7 release |
 | Boot with `tzdata` as well | About +0.2 s. Without it, pandas and `zoneinfo` know no time zones |
 | Boot with `scipy` as well | About +1.7 s (8.2 s for all four). Only `import scipy` runs at boot; the first cell to import `scipy.linalg` and `optimize` pays about 1.9 s more, `stats` about 1.7 s more |
+| Boot with a DataFrame in the store | About +5 s (13.5 s with the default packages), for loading pyarrow: Pyodide compiles libarrow's WebAssembly, and `import pandas` then imports pyarrow. A read then takes 0.1 s. Arrow IPC from pyarrow 26 on the host arrives intact in pyarrow 22 |
 | scipy's C and C++ code | qhull, the k-d tree, HiGHS (`linprog`, `milp`), sparse solvers and signal filters work, and their errors are ordinary exceptions |
 | `pyodide.mountNodeFS` under Deno | Reads work. A write, `chmod` or `utime` that reaches Deno is fatal to Pyodide (not used) |
 

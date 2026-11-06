@@ -1,8 +1,9 @@
 """The sandbox side of a `VariableStore`: the `host` object that reads it.
 
 main.ts loads this into a namespace of its own and gives `__main__` one `Host`, whose
-`read` goes through Deno (see `runner.setup_host`); it uses only the standard
-library. Every access reads `view.json` again; the store never changes a file once
+`read` goes through Deno (see `runner.setup_host`). It uses only the standard
+library, and pyarrow for Arrow values, which the session loads when the store has
+any (imported on the first read, unless `import pandas` already did). Every access reads `view.json` again; the store never changes a file once
 written, so a read can't see a half-written one. Ported from eryx-test's
 `host_accessor.py`, without `host.tools` for now.
 """
@@ -16,6 +17,18 @@ from typing import Any
 def read_file(path: str) -> bytes:
     with open(path, "rb") as f:
         return f.read()
+
+
+def _from_arrow(data: bytes, series: bool) -> Any:
+    """A DataFrame (or Series) from the Arrow IPC stream `variables._to_arrow` wrote."""
+    import pyarrow as pa
+
+    table = pa.ipc.open_stream(data).read_all()
+    frame = table.to_pandas()
+    if not series:
+        return frame
+    extra = json.loads(table.schema.metadata[b"pyodide_sandbox"])
+    return frame["values"].rename(extra["name"])
 
 
 class Host:
@@ -43,8 +56,11 @@ class Host:
 
     def _load(self, name: str, entry: dict[str, Any]) -> Any:
         data = self._read(f"{self._root}/blobs/{entry['blob']}")
-        if entry["codec"] == "pickle":
+        codec = entry["codec"]
+        if codec == "pickle":
             return pickle.loads(data)
+        if codec in ("arrow", "arrow-series"):
+            return _from_arrow(data, series=codec == "arrow-series")
         raise ValueError(f"host variable {name!r} has unknown codec {entry['codec']!r}")
 
     def __getitem__(self, name: str) -> Any:
