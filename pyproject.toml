@@ -3,12 +3,13 @@ name = "pyodide-sandbox"
 version = "0.1.0"
 description = "A pydantic-ai REPL capability that runs Python in Pyodide on Deno, one process per session"
 requires-python = ">=3.12"
+# Deno comes as a platform wheel. Pyodide's files are downloaded on first use
+# (pyodide_sandbox.distribution). numpy, pandas and scipy aren't needed on the host;
+# values pickled with other versions than the sandbox's get a warning.
 dependencies = [
-    "pydantic-ai-slim[anthropic]>=2.63.0",
+    "pydantic-ai-slim>=2.63.0",
     "pydantic-ai-harness>=0.63.0",
-    "numpy==2.4.6",
-    "pandas==3.0.2",
-    "scipy==1.18.0",
+    "deno==2.9.8",
 ]
 
 [build-system]
@@ -20,15 +21,18 @@ module-name = "pyodide_sandbox"
 
 [dependency-groups]
 dev = [
+    # the sandbox's versions, for the tests' pickled values
+    "numpy==2.4.6",
+    "pandas==3.0.2",
+    "scipy==1.18.0",
+    "pydantic-ai-slim[anthropic]>=2.63.0",  # the live demo
     "poethepoet>=0.49.0",
     "pytest>=9.1.1",
     "ruff>=0.17.3",
 ]
 
 [tool.poe.tasks]
-fetch = { cmd = "python scripts/fetch_pyodide.py", help = "Download the full Pyodide distribution into ./pyodide-dist (or $PYODIDE_DIST_DIR)" }
-deno-install = { shell = "cd deno && ${DENO:-$HOME/.deno/bin/deno} install", help = "Install the pinned pyodide npm package into deno/node_modules" }
-setup = { sequence = ["fetch", "deno-install"], help = "Everything the sandbox needs on disk (needs network once)" }
+fetch = { cmd = "python -m pyodide_sandbox fetch", help = "Download the Pyodide files the default packages need (sessions also do this on first use)" }
 agent = { cmd = "python scripts/run_agent_repl.py", help = "Let a pydantic-ai agent analyse data in the Pyodide REPL (needs ANTHROPIC_API_KEY)" }
 test = { cmd = "pytest", help = "Run the tests" }
 fmt = { cmd = "ruff format", help = "Format the code" }

@@ -3,8 +3,8 @@
 The process is the boundary, not Pyodide: code in a cell can reach JavaScript, so
 everything worth protecting stays on this side. Deno runs with no network, write,
 subprocess, FFI or environment access, can read only its own files, the Pyodide
-distribution and the variable store, if any, and gets an environment without the host's secrets. A cell over its
-time limit gets the process SIGKILLed, since Python inside Pyodide can catch an
+files and the variable store, if any, and gets an environment without the host's
+secrets. A cell over its time limit gets the process SIGKILLed, since Python inside Pyodide can catch an
 interrupt and a long C call wouldn't see one. Every message from Deno is checked
 before use, as a cell can write to the pipe itself.
 
@@ -29,10 +29,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any
 
+from pyodide_sandbox.distribution import default_dist_dir, ensure_distribution
 from pyodide_sandbox.variables import VariableStore
 
-ROOT = Path(__file__).resolve().parents[2]
-DENO_DIR = ROOT / "deno"
+# main.ts and the Python it runs inside Pyodide, shipped in the package
+DENO_DIR = Path(__file__).resolve().parent / "_deno"
 # tzdata: pandas and zoneinfo find no time zone without it (no system zoneinfo in wasm)
 DEFAULT_PACKAGES = ("numpy", "pandas", "scipy", "tzdata")
 
@@ -43,17 +44,15 @@ _MAX_FATAL_CHARS = 1000
 
 
 def default_deno() -> str:
-    """`$PYODIDE_SANDBOX_DENO`, else `deno` on PATH, else `~/.deno/bin/deno`."""
-    return (
-        os.environ.get("PYODIDE_SANDBOX_DENO")
-        or shutil.which("deno")
-        or str(Path.home() / ".deno" / "bin" / "deno")
-    )
+    """`$PYODIDE_SANDBOX_DENO`, else the pinned `deno` package's binary, else PATH's."""
+    if configured := os.environ.get("PYODIDE_SANDBOX_DENO"):
+        return configured
+    try:
+        import deno  # the `deno` dependency: Deno's binary in a platform wheel
 
-
-def default_dist_dir() -> Path:
-    """`$PYODIDE_DIST_DIR`, else `pyodide-dist/` in the project (`poe fetch`)."""
-    return Path(os.environ.get("PYODIDE_DIST_DIR", ROOT / "pyodide-dist"))
+        return deno.find_deno_bin()
+    except (ImportError, FileNotFoundError):
+        return shutil.which("deno") or "deno"
 
 
 class SessionError(Exception):
@@ -93,6 +92,7 @@ class PyodideSession:
         dist_dir: str | Path | None = None,
         max_output_bytes: int = 1 << 20,
         store: VariableStore | None = None,
+        download: bool = True,
     ) -> None:
         for name in packages:
             if not name.isidentifier():
@@ -102,6 +102,7 @@ class PyodideSession:
         self.dist_dir = Path(dist_dir) if dist_dir else default_dist_dir()
         self.max_output_bytes = max_output_bytes
         self.store = store
+        self.download = download
         self.boot_ms: float | None = None
         self._proc: subprocess.Popen[bytes] | None = None
         self._messages: queue.Queue[dict[str, Any] | None] = queue.Queue()
@@ -110,10 +111,6 @@ class PyodideSession:
         self._dead: SessionError | None = None
 
     def command(self) -> list[str]:
-        if not (self.dist_dir / "pyodide-lock.json").exists():
-            raise RuntimeError(
-                f"no Pyodide distribution in {self.dist_dir}; run `poe setup`"
-            )
         readable = [DENO_DIR, self.dist_dir.resolve()]
         store = []
         if self.store is not None:
@@ -144,9 +141,15 @@ class PyodideSession:
         )
 
     def start(self, timeout: float | None = 120.0) -> None:
-        """Start Deno and wait until Pyodide and the packages are loaded."""
+        """Start Deno and wait until Pyodide and the packages are loaded.
+
+        First downloads the Pyodide files the packages need into `dist_dir` if they
+        aren't there yet, unless `download` is false (not counted in `timeout`; see
+        `pyodide_sandbox.distribution`).
+        """
         if self._proc is not None:
             raise RuntimeError("session already started")
+        ensure_distribution(self.packages, self.dist_dir, download=self.download)
         command = self.command()
         start = time.perf_counter()
         self._proc = subprocess.Popen(

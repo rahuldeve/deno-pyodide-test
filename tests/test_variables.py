@@ -9,6 +9,7 @@ import hashlib
 import importlib.util
 import json
 import pickle
+import warnings
 from collections.abc import Iterator
 from typing import Any
 
@@ -17,8 +18,9 @@ import pandas as pd
 import pytest
 import scipy.sparse
 
+from pyodide_sandbox.distribution import SANDBOX_VERSIONS
 from pyodide_sandbox.session import DENO_DIR, PyodideSession, SessionCrashed
-from pyodide_sandbox.variables import VariableStore
+from pyodide_sandbox.variables import VariableStore, VersionMismatchWarning
 
 # deno/host.py runs in the sandbox, but only needs the standard library
 _spec = importlib.util.spec_from_file_location("pyodide_host", DENO_DIR / "host.py")
@@ -151,6 +153,29 @@ def test_a_key_error_while_loading_is_not_a_missing_variable() -> None:
         pytest.raises(KeyError, match="inner"),
     ):
         _ = host_for(store).x
+
+
+def test_warns_when_pickled_by_another_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(SANDBOX_VERSIONS, "numpy", "0.0")
+    with pytest.warns(
+        VersionMismatchWarning,
+        match="'arr' was pickled with numpy 2.4.6 but the sandbox has numpy 0.0",
+    ) as record:
+        VariableStore({"x": [1], "arr": np.arange(3)}).close()
+    assert [w.filename for w in record] == [__file__]
+    # also inside a container, and through pandas
+    with pytest.warns(VersionMismatchWarning, match="'data' was pickled with numpy"):
+        VariableStore({"data": {"df": pd.DataFrame({"a": [1]})}}).close()
+
+
+def test_no_warning_for_the_sandboxs_versions() -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        VariableStore(
+            {"arr": np.arange(3), "df": weather(), "s": scipy.sparse.eye_array(2)}
+        ).close()
 
 
 def test_host_is_read_only() -> None:

@@ -18,10 +18,13 @@
 //
 // With --store, cells read the host's variables in DIR as `host.NAME` (runner.setup_host).
 
-import { loadPyodide } from "pyodide";
-
 const t0 = performance.now();
 const args = parseArgs(Deno.args);
+// From the distribution itself, not npm, so the two are always the same release
+const { loadPyodide } = await import(
+  "file://" + args.dist.split("/").map(encodeURIComponent).join("/") +
+    "pyodide.mjs"
+);
 const encoder = new TextEncoder();
 const stdoutWriter = Deno.stdout.writable.getWriter();
 

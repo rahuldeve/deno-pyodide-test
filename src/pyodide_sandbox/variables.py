@@ -2,7 +2,7 @@
 
 `VariableStore` pickles each value into its own file in a temporary directory. A
 session given the store lets Deno read that directory (and only read it), and defines
-`host` in the sandbox (`deno/host.py`), which loads a value when it is read:
+`host` in the sandbox (`_deno/host.py`), which loads a value when it is read:
 
     with VariableStore({"df": df}) as store:
         session = PyodideSession(store=store)
@@ -11,8 +11,11 @@ session given the store lets Deno read that directory (and only read it), and de
 
 Every read unpickles the file again, so it returns a fresh copy. The store can't be
 changed after it is created. Unpickling in the sandbox is safe for the host. It needs
-the values' modules in the sandbox (pandas and numpy, pinned on the host to the
-sandbox's versions) and can't load classes defined only on the host.
+the values' modules in the sandbox and can't load classes defined only on the host.
+A numpy, pandas or scipy object pickled by another version than the sandbox's
+(`distribution.SANDBOX_VERSIONS`) may not load there, so the store warns
+(`VersionMismatchWarning`) when it pickles one; pin those versions on the host to
+be sure.
 
 The directory isn't mounted into Pyodide's filesystem. `host` reads it through Deno
 instead (`Deno.readFileSync`), because Pyodide's NODEFS mount passes a cell's
@@ -28,20 +31,30 @@ read-only mount, with a copy of the accessor):
 """
 
 import hashlib
+import io
 import json
 import keyword
 import os
 import pathlib
 import pickle
 import shutil
+import sys
 import tempfile
+import types
+import warnings
 import weakref
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from types import TracebackType
 from typing import Any, Self
 
+from pyodide_sandbox.distribution import SANDBOX_VERSIONS
+
 _FORMAT = 1
+
+
+class VersionMismatchWarning(UserWarning):
+    """A value was pickled by another numpy, pandas or scipy than the sandbox has."""
 
 
 @dataclass(frozen=True)
@@ -73,7 +86,10 @@ class VariableStore:
         bad = [n for n in values if not _is_name(n)]
         if bad:
             raise ValueError(f"variable names must be Python identifiers: {bad}")
-        pickled = {name: pickle.dumps(value) for name, value in values.items()}
+        pickled = {}
+        for name, value in values.items():
+            pickled[name], modules = _pickle(value)
+            _check_versions(name, modules)
         # resolved, as Deno's --allow-read compares real paths
         self._dir = pathlib.Path(tempfile.mkdtemp(prefix="pyodide-store-")).resolve()
         self._finalizer = weakref.finalize(
@@ -138,6 +154,41 @@ class VariableStore:
     def __repr__(self) -> str:
         listed = ", ".join(f"{e.name}: {e.type}" for e in self._entries.values())
         return f"VariableStore({listed})"
+
+
+class _Pickler(pickle.Pickler):
+    """Records the top-level modules of the classes and functions it pickles."""
+
+    def __init__(self, file: io.BytesIO) -> None:
+        super().__init__(file)
+        self.modules: set[str] = set()
+
+    def persistent_id(self, obj: Any) -> None:  # None: pickle `obj` as usual
+        module = type(obj).__module__
+        if isinstance(obj, (type, types.FunctionType, types.BuiltinFunctionType)):
+            module = obj.__module__ or ""
+        self.modules.add(module.partition(".")[0])
+
+
+def _pickle(value: Any) -> tuple[bytes, set[str]]:
+    buffer = io.BytesIO()
+    pickler = _Pickler(buffer)
+    pickler.dump(value)
+    return buffer.getvalue(), pickler.modules
+
+
+def _check_versions(name: str, modules: set[str]) -> None:
+    for module in sorted(modules & SANDBOX_VERSIONS.keys()):
+        host = getattr(sys.modules.get(module), "__version__", None)
+        sandbox = SANDBOX_VERSIONS[module]
+        if host != sandbox:
+            warnings.warn(
+                f"{name!r} was pickled with {module} {host} but the sandbox has "
+                f"{module} {sandbox}, so it may not load there; pin "
+                f"{module}=={sandbox} on the host to be sure",
+                VersionMismatchWarning,
+                stacklevel=3,
+            )
 
 
 def _atomic_write(path: pathlib.Path, data: bytes) -> None:

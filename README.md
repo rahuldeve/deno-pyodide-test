@@ -2,8 +2,8 @@
 
 A pydantic-ai capability, `PyodideRepl`, that gives an agent a persistent, sandboxed
 Python REPL: Pyodide 314.0.7 (Python 3.14) running in its own Deno process, with
-numpy 2.4.6, pandas 3.0.2 and scipy 1.18.0 loaded from local files. Code in a cell reads host
-values (a DataFrame, say) as `host.NAME`. Phase 0 of the plan in
+numpy 2.4.6, pandas 3.0.2 and scipy 1.18.0 loaded from local files. Code in a cell
+reads host values (a DataFrame, say) as `host.NAME`. Phase 0 of the plan in
 [Pyodide on Deno as an eryx backend](<Pyodide on Deno as an eryx backend.md>); the
 capability is a port of eryx-test's `EryxRepl`.
 
@@ -16,13 +16,43 @@ repl = PyodideRepl(variables={"df": df}, on_change="append")
 agent = Agent("anthropic:claude-sonnet-5-5", capabilities=[repl])
 ```
 
-## Setup
+## Using it as a library
 
 ```sh
-# Deno 2.9.8 in ~/.deno/bin (found on PATH, or set PYODIDE_SANDBOX_DENO)
+uv add "pyodide-sandbox @ git+ssh://…/pyodide-sandbox"   # or a path, or an index
+```
+
+That is all the install there is:
+
+- **Deno** comes from the `deno` package on PyPI (pinned to 2.9.8), which ships the
+  binary as a platform wheel (Linux x86_64/aarch64, macOS, Windows).
+  `$PYODIDE_SANDBOX_DENO` overrides it.
+- **Pyodide** is downloaded when the first session starts: the runtime (14 MB) and
+  the wheels of `packages` with their dependencies (22 MB for the defaults), not the
+  337 MB release. They go to `$PYODIDE_DIST_DIR`, else
+  `~/.cache/pyodide-sandbox/314.0.7` (`$XDG_CACHE_HOME` is respected), and later
+  sessions use them offline. A package added later is downloaded then. The
+  runtime's sha256s are pinned in `distribution.py`, and the pinned
+  `pyodide-lock.json` holds every wheel's, so only the release's own files are kept.
+  Files are renamed into place when complete, under a lock file, so sessions can
+  share a cache. The download is not counted in `startup_timeout_ms`.
+- **The download source** is jsDelivr's Pyodide CDN. `$PYODIDE_INDEX_URL` (or
+  `index_url=` on `ensure_distribution`) points it at a mirror of the release
+  instead, e.g. an internal artifact store; the hashes still apply.
+- **To fetch ahead of time**, e.g. in a Docker build step, so that sessions never
+  need the network, run `python -m pyodide_sandbox fetch [PACKAGE ...] [--dir DIR]`
+  and set `PyodideRepl(download=False)`. Then a missing file fails the start
+  instead.
+- **Host values** pickled by numpy, pandas or scipy load reliably only with the
+  sandbox's versions (`SANDBOX_VERSIONS`). The library doesn't pin them on the host;
+  a `VersionMismatchWarning` names the value and the version to pin.
+
+## Developing
+
+```sh
 uv sync
-uv run poe setup     # downloads the 337 MB Pyodide distribution (sha256-checked) and the npm package
-uv run poe test      # 111 tests, ~3.5 min; the sandbox ones skip without Deno or the distribution
+uv run poe fetch     # optional; the first session downloads the same files
+uv run poe test      # 120 tests, ~3.5 min; the sandbox ones skip without Deno
 uv run poe agent     # live demo, needs ANTHROPIC_API_KEY
 ```
 
@@ -33,11 +63,12 @@ uv run poe agent     # live demo, needs ANTHROPIC_API_KEY
 | `src/pyodide_sandbox/repl.py` | `PyodideRepl`: `run_code`, `repl_history`, the cell index in the instructions, restart on timeout or crash |
 | `src/pyodide_sandbox/session.py` | `PyodideSession`: starts and kills the Deno process, speaks JSON lines, checks every reply |
 | `src/pyodide_sandbox/variables.py` | `VariableStore`: host values pickled into a temporary directory that only the session's Deno can read, and only read |
-| `deno/main.ts` | Loads Pyodide and the packages, captures each cell's stdout and stderr (including C-level writes), caps them at 1 MB |
-| `deno/runner.py` | Runs a cell in Pyodide: `CodeRunner` as `<cell-N>`, echoes the last expression's `repr`, trims tracebacks to the cell's frames |
-| `deno/host.py` | The `host` object in the sandbox: reads the store's `view.json` and unpickles a value on every read, so each read is a fresh copy |
+| `src/pyodide_sandbox/distribution.py` | Downloads and checks the Pyodide files the packages need; `python -m pyodide_sandbox fetch` |
+| `src/pyodide_sandbox/_deno/main.ts` | Imports Pyodide from those files (no npm), loads it and the packages, captures each cell's stdout and stderr (including C-level writes), caps them at 1 MB |
+| `src/pyodide_sandbox/_deno/runner.py` | Runs a cell in Pyodide: `CodeRunner` as `<cell-N>`, echoes the last expression's `repr`, trims tracebacks to the cell's frames |
+| `src/pyodide_sandbox/_deno/host.py` | The `host` object in the sandbox: reads the store's `view.json` and unpickles a value on every read, so each read is a fresh copy |
 
-Deno runs with `--no-prompt --cached-only --no-remote --allow-read=<deno dir>,<pyodide-dist>,<store>`,
+Deno runs with `--no-prompt --cached-only --no-remote --allow-read=<_deno>,<Pyodide files>,<store>`,
 so it has no network, write, subprocess, FFI or env access. It gets none of the host's
 environment variables. The time limit is a SIGKILL of the process, and the next cell
 starts a new process. If Pyodide itself fails for good (`os._exit`, or a JavaScript
@@ -45,8 +76,9 @@ error inside one of its syscalls), `main.ts` reports the cause and exits, and th
 cell starts a new process too. A JavaScript error that nothing catches but that
 leaves Pyodide usable goes to the running cell's stderr, and the session goes on.
 
-Host variables are pickled on the host and unpickled in the sandbox, so the host pins
-numpy, pandas and scipy to the sandbox's versions. A class defined only on the host fails
+Host variables are pickled on the host and unpickled in the sandbox, so numpy, pandas
+and scipy values need the sandbox's versions on the host (pinned in the dev
+dependencies here, warned about otherwise). A class defined only on the host fails
 when a cell reads it. The store isn't mounted into Pyodide's filesystem: `host` reads
 it with `Deno.readFileSync`. Through a NODEFS mount, a cell's `os.chmod` or `os.utime`
 reaches Deno, and Deno's refusal breaks Pyodide for good, even with the files

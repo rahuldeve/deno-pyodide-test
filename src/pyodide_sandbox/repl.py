@@ -176,7 +176,14 @@ class PyodideRepl(AbstractCapability[Any]):
     """The Deno executable; `None` uses `pyodide_sandbox.session.default_deno()`."""
 
     dist_dir: str | Path | None = None
-    """The Pyodide distribution; `None` uses `$PYODIDE_DIST_DIR` or `./pyodide-dist`."""
+    """Where the Pyodide files are kept; `None` uses `$PYODIDE_DIST_DIR`, else the
+    user's cache (`pyodide_sandbox.distribution.default_dist_dir()`)."""
+
+    download: bool = True
+    """Download the Pyodide files `packages` need when the first session starts, if
+    they aren't in `dist_dir` yet (about 36 MB for the default packages). With
+    `False`, a missing file fails the start; fetch them ahead of time with
+    `python -m pyodide_sandbox fetch`."""
 
     _session: PyodideSession | None = field(default=None, init=False, repr=False)
     _cells: list[Cell] = field(default_factory=list, init=False, repr=False)
@@ -336,15 +343,16 @@ class PyodideRepl(AbstractCapability[Any]):
                 self.packages,
                 deno=self.deno,
                 dist_dir=self.dist_dir,
+                download=self.download,
                 max_output_bytes=self.max_output_bytes,
                 store=self._host,
             )
-            # Failures here are host setup problems (no Deno, no distribution, a
-            # package that won't load, a closed store), not something for the model to see as a
-            # cell error
+            # Failures here are host setup problems (no Deno, a failed download, a
+            # package that won't load, a closed store), not something for the model
+            # to see as a cell error
             try:
                 session.start(timeout=self.startup_timeout_ms / 1000)
-            except (SessionError, OSError, RuntimeError) as e:
+            except (SessionError, OSError, RuntimeError, ValueError) as e:
                 session.close()
                 raise RuntimeError(
                     f"starting the PyodideRepl session failed: {e}"

@@ -5,6 +5,7 @@ from collections.abc import Iterator
 
 import pytest
 
+from pyodide_sandbox.distribution import DistributionError
 from pyodide_sandbox.session import (
     DENO_DIR,
     PyodideSession,
@@ -333,15 +334,18 @@ def test_garbage_on_the_pipe_is_a_crash(bare: PyodideSession) -> None:
     assert not bare.alive
 
 
-def test_boot_failure_reports_stderr() -> None:
+def test_unknown_package() -> None:
     session = PyodideSession(("no_such_package",))
-    with pytest.raises(SessionCrashed, match="exited with code 1 during boot:\n"):
+    with pytest.raises(ValueError, match="not in Pyodide 314.0.7: no_such_package"):
         session.start()
+    assert session._proc is None
 
 
-def test_missing_distribution(tmp_path) -> None:
-    with pytest.raises(RuntimeError, match="poe setup"):
-        PyodideSession(dist_dir=tmp_path).start()
+def test_missing_files_without_download(tmp_path) -> None:
+    session = PyodideSession(dist_dir=tmp_path, download=False)
+    with pytest.raises(DistributionError, match="python -m pyodide_sandbox fetch"):
+        session.start()
+    assert list(tmp_path.iterdir()) == []
 
 
 # Recorded facts about Pyodide 314.0.7's numpy, which the REPL's instructions repeat
