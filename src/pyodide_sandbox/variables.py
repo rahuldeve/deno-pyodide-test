@@ -18,9 +18,12 @@ pandas or pyarrow version, so the host can use any pandas; the sandbox reads it
 with its own pyarrow, which the session then loads (`sandbox_packages`; about 5 s
 more boot, as Pyodide compiles libarrow). Arrow keeps dtypes (tz-aware datetimes,
 categoricals, nullable and string dtypes), the index and column names, and
-`df.attrs`. A frame Arrow can't convert (an object column of mixed
-types, duplicate column names), a subclass, or a Series whose name isn't a plain
-scalar is pickled instead.
+`df.attrs`. Each frame is decoded back on the host as the sandbox will decode
+it, and one that doesn't come back equal is pickled instead: one Arrow can't
+convert (an object column of mixed types, duplicate column names, an int over 64
+bits) or would change (a column of sets or dicts, mixed time zones, column names
+of mixed types, attrs that aren't JSON). So is a subclass, or a Series whose name
+isn't a plain scalar.
 
 Everything else is pickled. Unpickling in the sandbox is safe for the host. It needs
 the values' modules in the sandbox and can't load classes defined only on the host.
@@ -59,6 +62,7 @@ from dataclasses import asdict, dataclass
 from types import TracebackType
 from typing import Any, Self
 
+from pyodide_sandbox._deno.host import _from_arrow as from_arrow
 from pyodide_sandbox.distribution import SANDBOX_VERSIONS
 
 
@@ -184,7 +188,12 @@ def _pyarrow() -> types.ModuleType | None:
 
 
 def _to_arrow(value: Any) -> tuple[bytes, str] | None:
-    """A DataFrame or Series as an Arrow IPC stream and its codec, else None."""
+    """A DataFrame or Series as an Arrow IPC stream and its codec, else None.
+
+    None too when the conversion fails or loses something (a column of sets or
+    dicts, mixed time zones, column names of mixed types, attrs that aren't JSON):
+    the stream is decoded back as the sandbox will, and must equal `value`.
+    """
     pandas = sys.modules.get("pandas")
     # exact types: a subclass (a GeoDataFrame, say) would come back as its base
     if pandas is None or type(value) not in (pandas.DataFrame, pandas.Series):
@@ -192,25 +201,50 @@ def _to_arrow(value: Any) -> tuple[bytes, str] | None:
     pa = _pyarrow()
     if pa is None:
         return None
-    if type(value) is pandas.Series:
-        if not isinstance(value.name, (str, int, float, bool, type(None))):
-            return None
-        frame, codec = value.to_frame(_SERIES_COLUMN), "arrow-series"
-        extra = {"name": value.name}
-    else:
-        frame, codec, extra = value, "arrow", {}
-    try:
-        table = pa.Table.from_pandas(frame)
-    except (pa.ArrowException, TypeError, ValueError):
+    series = type(value) is pandas.Series
+    if series and not isinstance(value.name, (str, int, float, bool, type(None))):
         return None
-    if extra:
+    try:
+        # pyarrow warns of what it loses; the check below catches that anyway
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = _encode_arrow(pa, value, series)
+            if not _same_frame(pandas, from_arrow(data, series), value):
+                return None
+    # anything: a value pyarrow can't take (an int over 64 bits raises
+    # OverflowError) is pickled instead
+    except Exception:  # noqa: BLE001
+        return None
+    return data, "arrow-series" if series else "arrow"
+
+
+def _encode_arrow(pa: types.ModuleType, value: Any, series: bool) -> bytes:
+    frame = value.to_frame(_SERIES_COLUMN) if series else value
+    table = pa.Table.from_pandas(frame)
+    if series:
         metadata = {**(table.schema.metadata or {})}
-        metadata[_ARROW_METADATA] = json.dumps(extra).encode()
+        metadata[_ARROW_METADATA] = json.dumps({"name": value.name}).encode()
         table = table.replace_schema_metadata(metadata)
     sink = pa.BufferOutputStream()
     with pa.ipc.new_stream(sink, table.schema) as writer:
         writer.write_table(table)
-    return sink.getvalue().to_pybytes(), codec
+    return sink.getvalue().to_pybytes()
+
+
+def _same_frame(pandas: types.ModuleType, back: Any, value: Any) -> bool:
+    """Whether `back` equals `value` in values, dtypes, index, names and attrs."""
+    if type(back) is not type(value) or back.attrs != value.attrs:
+        return False
+    check = (
+        pandas.testing.assert_series_equal
+        if type(value) is pandas.Series
+        else pandas.testing.assert_frame_equal
+    )
+    try:
+        check(back, value, check_exact=True)
+    except AssertionError:
+        return False
+    return True
 
 
 class _Pickler(pickle.Pickler):

@@ -220,10 +220,37 @@ def frames() -> dict[str, Any]:
         "duplicates": pd.DataFrame([[1, 2]], columns=["a", "a"]),
         "tuple_named": pd.Series([1], name=("a", "b")),
         "subclass": SubFrame({"a": [1]}),
+        "big_int": pd.DataFrame({"a": [2**70]}),  # pyarrow raises OverflowError
+        # converted, but wouldn't come back the same
+        "sets": pd.DataFrame({"a": [{1}, {2, 3}]}),
+        "dicts": pd.DataFrame({"a": [{"x": 1}, {"y": 2}]}),
+        "lists": pd.Series([[1], [2, 3]], name="l"),
+        "mixed_tz": pd.Series(
+            [
+                pd.Timestamp("2026-01-01", tz="UTC"),
+                pd.Timestamp("2026-01-01T00:00+05:30"),
+            ]
+        ),
+        "mixed_names": pd.DataFrame({"a": [1], 1: [2]}),
+        "attrs_not_json": pd.DataFrame({"a": [1]}).pipe(
+            lambda d: d.attrs.update(n=np.int64(1)) or d
+        ),
     }
 
 
-PICKLED = {"mixed", "duplicates", "tuple_named", "subclass"}
+PICKLED = {
+    "mixed",
+    "duplicates",
+    "tuple_named",
+    "subclass",
+    "big_int",
+    "sets",
+    "dicts",
+    "lists",
+    "mixed_tz",
+    "mixed_names",
+    "attrs_not_json",
+}
 
 
 def describe(value: Any) -> str:
@@ -234,7 +261,10 @@ def describe(value: Any) -> str:
 
 def test_dataframes_go_as_arrow() -> None:
     values = frames()
-    with VariableStore(values) as store:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # pyarrow's own warnings are silenced
+        store = VariableStore(values)
+    with store:
         assert {n: store.info(n).codec for n in values} == {
             n: "pickle"
             if n in PICKLED
