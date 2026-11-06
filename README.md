@@ -10,7 +10,7 @@ capability is a port of eryx-test's `EryxRepl`.
 from pydantic_ai import Agent
 from pyodide_sandbox import PyodideRepl
 
-repl = PyodideRepl(on_change="append")          # packages=("numpy", "pandas")
+repl = PyodideRepl(on_change="append")  # packages=("numpy", "pandas")
 agent = Agent("anthropic:claude-sonnet-5-5", capabilities=[repl])
 ```
 
@@ -47,7 +47,7 @@ starts a new process.
 | SIGKILL during one `np.linalg.svd` call with a 0.5 s limit | process gone within 1 s |
 | `js.fetch`, reading `/etc`, writing, `Deno.env`, `Deno.Command`, `Deno.dlopen` from a cell | all refused by Deno (`NotCapable`) |
 | Python `open()` | Emscripten's in-memory FS; host files, even those Deno can read, aren't visible |
-| numpy errors | Same as eryx: no warnings, `errstate` silent, `inv`/`solve`/`cholesky` give NaN, `1 // 0 == 0`; also default int is **int32**, and overflow wraps |
+| numpy errors | Float and array errors are silent: no warnings, `errstate(all="raise")` doesn't raise, `inv`/`solve`/`cholesky` give NaN, integer array `// 0` gives 0. Integer scalars and plain Python still warn or raise. Default int is **int32**, and overflow wraps |
 | `maxMemoryBytes` | Not in the 314.0.7 release |
 
 ## Not in phase 0

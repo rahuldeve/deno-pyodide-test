@@ -60,14 +60,17 @@ no way to install packages. Loaded: {packages}. Top-level `await` works.{numeric
 # What tests/test_session.py::test_numerics records for Pyodide 314.0.7's numpy
 NUMERICS = """
 
-Numerical errors are silent in this sandbox, because WebAssembly has no \
-floating-point error flags. numpy never warns about division by zero, overflow or invalid values, and \
-`np.errstate` doesn't raise. `np.linalg.inv`, `solve` and `cholesky` return NaNs \
-instead of raising `LinAlgError`, so NaNs from them mean the call failed. Integer \
-division by zero returns 0. Check computed values with `np.isfinite` before trusting \
-them, and before NaN-skipping steps such as `np.nanmean` or `dropna` hide a failure. \
-numpy's default integer is 32-bit here (`np.arange(3).dtype` is int32) and integer \
-overflow wraps around silently, so pass `dtype=np.int64` for large integers."""
+numpy's floating-point errors are silent in this sandbox, because WebAssembly has no \
+floating-point error flags. Array and float operations that would normally warn \
+about division by zero, overflow or invalid values (such as `np.sqrt(-1)`) don't, \
+and `np.errstate(all="raise")` doesn't raise for them. `np.linalg.inv`, `solve` and \
+`cholesky` return NaNs instead of raising `LinAlgError`, so NaNs from them mean the \
+call failed. Integer array division by zero returns 0 without a warning. Plain \
+Python arithmetic and `math` still raise as usual. Check computed values with \
+`np.isfinite` before trusting them, and before NaN-skipping steps such as \
+`np.nanmean` or `dropna` hide a failure. numpy's default integer is 32-bit here \
+(`np.arange(3).dtype` is int32) and integer overflow wraps around silently, so pass \
+`dtype=np.int64` for large integers."""
 
 PYTHON_VERSION = "3.14"
 

@@ -251,50 +251,76 @@ def test_missing_distribution(tmp_path) -> None:
 
 
 # Recorded facts about Pyodide 314.0.7's numpy, which the REPL's instructions repeat
+# (repl.NUMERICS). Native numpy warns or raises in every case marked "silent" here,
+# except integer overflow, which wraps silently there too.
+
+NUMERICS_PROBE = """\
+import math, warnings, numpy as np
+
+def outcome(f, raise_=False):
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        try:
+            if raise_:
+                with np.errstate(all="raise"):
+                    r = f()
+            else:
+                r = f()
+        except Exception as e:
+            return f"raises {type(e).__name__}"
+    if w:
+        return "warns"
+    if isinstance(r, np.ndarray) and r.dtype.kind == "f" and np.isnan(r).all():
+        return "nan"
+    return f"silent {r.tolist() if hasattr(r, 'tolist') else r!r}"
+
+f64 = np.float64
+cases = {
+    # float errors: numpy reads them from the FPU's flags, which wasm doesn't have
+    "float div by zero": lambda: f64(1) / f64(0),
+    "float overflow": lambda: f64(1e308) * 10,
+    "invalid sqrt": lambda: np.sqrt(f64(-1)),
+    "array div by zero": lambda: np.array([1.0]) / np.array([0.0]),
+    "int array // 0": lambda: np.array([1]) // np.array([0]),
+    "inv singular": lambda: np.linalg.inv(np.zeros((2, 2))),
+    "solve singular": lambda: np.linalg.solve(np.zeros((2, 2)), np.ones(2)),
+    "cholesky not PD": lambda: np.linalg.cholesky(-np.eye(2)),
+    # checked in software, so unaffected
+    "int scalar // 0": lambda: np.int64(1) // np.int64(0),
+    "python 1.0 / 0": lambda: 1.0 / 0,
+    "math.sqrt(-1)": lambda: math.sqrt(-1),
+    # wraps natively too, but the default int is narrower
+    "default int overflow": lambda: np.array([2**31 - 1]) + 1,
+}
+out = {name: outcome(f) for name, f in cases.items()}
+for name in ["float div by zero", "float overflow", "invalid sqrt", "int scalar // 0"]:
+    out[name + " errstate"] = outcome(cases[name], raise_=True)
+out["default int"] = str(np.arange(3).dtype)
+for name, value in out.items():
+    print(f"{name}: {value}")
+"""
 
 
 def test_numerics(numpy_session: PyodideSession) -> None:
-    code = """\
-import warnings, numpy as np
-out = {}
-with warnings.catch_warnings(record=True) as w:
-    warnings.simplefilter("always")
-    out["div"] = (float(np.float64(1) / np.float64(0)), len(w))
-try:
-    with np.errstate(all="raise"):
-        np.float64(1) / np.float64(0)
-    out["errstate"] = "silent"
-except FloatingPointError:
-    out["errstate"] = "raised"
-for name, call in [
-    ("inv", lambda: np.linalg.inv(np.zeros((2, 2)))),
-    ("solve", lambda: np.linalg.solve(np.zeros((2, 2)), np.ones(2))),
-    ("cholesky", lambda: np.linalg.cholesky(-np.eye(2))),
-]:
-    try:
-        out[name] = "nan" if np.isnan(call()).all() else "other"
-    except np.linalg.LinAlgError:
-        out[name] = "LinAlgError"
-out["intdiv"] = int((np.array([1]) // np.array([0]))[0])
-out["dtype"] = str(np.arange(3).dtype)
-out["overflow"] = int((np.array([2**31 - 1]) + 1)[0])
-out
-"""
-    result = numpy_session.run(code)
+    result = numpy_session.run(NUMERICS_PROBE)
     assert result.error is None, result.stderr
-    assert (
-        result.stdout
-        == repr(
-            {
-                "div": (float("inf"), 0),
-                "errstate": "silent",
-                "inv": "nan",
-                "solve": "nan",
-                "cholesky": "nan",
-                "intdiv": 0,
-                "dtype": "int32",
-                "overflow": -(2**31),
-            }
-        )
-        + "\n"
-    )
+    seen = dict(line.split(": ", 1) for line in result.stdout.splitlines())
+    assert seen == {
+        "float div by zero": "silent inf",
+        "float overflow": "silent inf",
+        "invalid sqrt": "silent nan",
+        "array div by zero": "silent [inf]",
+        "int array // 0": "silent [0]",
+        "inv singular": "nan",
+        "solve singular": "nan",
+        "cholesky not PD": "nan",
+        "int scalar // 0": "warns",
+        "python 1.0 / 0": "raises ZeroDivisionError",
+        "math.sqrt(-1)": "raises ValueError",
+        "default int overflow": "silent [-2147483648]",
+        "float div by zero errstate": "silent inf",
+        "float overflow errstate": "silent inf",
+        "invalid sqrt errstate": "silent nan",
+        "int scalar // 0 errstate": "raises FloatingPointError",
+        "default int": "int32",
+    }
