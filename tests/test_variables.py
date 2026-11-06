@@ -15,6 +15,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import pytest
+import scipy.sparse
 
 from pyodide_sandbox.session import DENO_DIR, PyodideSession, SessionCrashed
 from pyodide_sandbox.variables import VariableStore
@@ -189,6 +190,7 @@ def store() -> Iterator[VariableStore]:
             "df": weather(),
             "arr": np.arange(6, dtype=np.int64).reshape(2, 3),
             "when": datetime.datetime(2026, 11, 6, 12, 30),
+            "sparse": scipy.sparse.csr_array([[0, 2.5], [1, 0]]),
         }
     ) as store:
         yield store
@@ -222,11 +224,14 @@ def test_values_arrive_intact(session: PyodideSession) -> None:
 
 
 def test_plain_values(session: PyodideSession) -> None:
-    result = session.run("host.x, host['data'], host.arr.tolist(), host.when")
+    result = session.run(
+        "host.x, host['data'], host.arr.tolist(), host.when, "
+        "type(host.sparse).__name__, host.sparse.toarray().tolist()"
+    )
     assert result.error is None, result.stderr
     assert result.stdout == (
         "(1, {'a': [1, 2]}, [[0, 1, 2], [3, 4, 5]], "
-        "datetime.datetime(2026, 11, 6, 12, 30))\n"
+        "datetime.datetime(2026, 11, 6, 12, 30), 'csr_array', [[0.0, 2.5], [1.0, 0.0]])\n"
     )
 
 
@@ -237,7 +242,7 @@ def test_setup_leaves_only_host(session: PyodideSession) -> None:
     )
     assert result.stdout == (
         "([], 'host variables: x (int), data (dict), df (DataFrame), "
-        "arr (ndarray), when (datetime)')\n"
+        "arr (ndarray), when (datetime), sparse (csr_array)')\n"
     )
 
 
@@ -248,7 +253,7 @@ def test_traceback_shows_the_accessor(session: PyodideSession) -> None:
     assert "raise AttributeError(e.args[0]) from None" in result.stderr
     assert result.stderr.endswith(
         "AttributeError: no host variable 'missing'; available: "
-        "x, data, df, arr, when\n"
+        "x, data, df, arr, when, sparse\n"
     )
 
 

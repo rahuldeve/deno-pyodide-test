@@ -68,12 +68,15 @@ floating-point error flags. Array and float operations that would normally warn 
 about division by zero, overflow or invalid values (such as `np.sqrt(-1)`) don't, \
 and `np.errstate(all="raise")` doesn't raise for them. `np.linalg.inv`, `solve` and \
 `cholesky` return NaNs instead of raising `LinAlgError`, so NaNs from them mean the \
-call failed. Integer array division by zero returns 0 without a warning. Plain \
+call failed.{scipy_linalg} Integer array division by zero returns 0 without a warning. Plain \
 Python arithmetic and `math` still raise as usual. Check computed values with \
 `np.isfinite` before trusting them, and before NaN-skipping steps such as \
 `np.nanmean` or `dropna` hide a failure. numpy's default integer is 32-bit here \
 (`np.arange(3).dtype` is int32) and integer overflow wraps around silently, so pass \
 `dtype=np.int64` for large integers."""
+
+SCIPY_LINALG = """ `scipy.linalg`'s `inv`, `solve` and `cholesky` do raise \
+`LinAlgError`, so prefer them."""
 
 PYTHON_VERSION = "3.14"
 
@@ -305,7 +308,11 @@ class PyodideRepl(AbstractCapability[Any]):
         text = INSTRUCTIONS.format(
             python=PYTHON_VERSION,
             packages=", ".join(self.packages) or "the standard library only",
-            numerics=NUMERICS if "numpy" in self.packages else "",
+            numerics=NUMERICS.format(
+                scipy_linalg=SCIPY_LINALG if "scipy" in self.packages else ""
+            )
+            if "numpy" in self.packages
+            else "",
         )
         if names := self._host.names():
             listed = ", ".join(f"{n} ({self._host.info(n).type})" for n in names)

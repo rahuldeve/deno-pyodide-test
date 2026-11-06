@@ -38,6 +38,50 @@ def test_packages_load_offline(numpy_session: PyodideSession) -> None:
     assert numpy_session.boot_ms is not None
 
 
+SCIPY_CELL = """\
+import numpy as np
+from scipy import integrate, optimize, signal, sparse, stats
+from scipy.sparse.linalg import spsolve
+from scipy.spatial import ConvexHull, cKDTree
+
+points = np.random.default_rng(0).random((50, 2))
+b, a = signal.butter(3, 0.2)
+print(scipy.__version__)
+print(round(stats.norm.ppf(0.975), 4), round(stats.ttest_ind([1, 2, 3, 4], [2, 3, 4, 9]).pvalue, 4))
+print(optimize.minimize(lambda x: (x[0] - 3) ** 2 + (x[1] + 1) ** 2, [0, 0]).x.round(4).tolist())
+print(round(integrate.quad(np.sin, 0, np.pi)[0], 6))
+print(spsolve(sparse.csr_matrix([[4.0, 1], [1, 3]]), np.array([1.0, 2])).round(4).tolist())
+print(signal.filtfilt(b, a, np.arange(20.0))[:2].round(3).tolist())
+# C++: qhull, the k-d tree, and HiGHS behind linprog
+print(len(ConvexHull(points).vertices), int(cKDTree(points).query([0.5, 0.5])[1]))
+print(optimize.linprog([-1, -2], A_ub=[[1, 1]], b_ub=[4], bounds=[(0, 3), (0, 3)]).x.tolist())
+"""
+
+
+def test_scipy(numpy_session: PyodideSession) -> None:
+    result = numpy_session.run("import scipy\n" + SCIPY_CELL, timeout=60)
+    assert result.error is None, result.stderr
+    assert result.stdout.splitlines() == [
+        "1.18.0",
+        "1.96 0.2797",
+        "[3.0, -1.0]",
+        "2.0",
+        "[0.0909, 0.6364]",
+        "[0.001, 0.995]",
+        "11 37",
+        "[1.0, 3.0]",
+    ]
+
+
+def test_scipy_errors_from_native_code(numpy_session: PyodideSession) -> None:
+    # qhull reports its error from C; the session carries on
+    result = numpy_session.run(
+        "from scipy.spatial import ConvexHull\nConvexHull([[0, 0], [1, 1], [2, 2]])"
+    )
+    assert result.error == "QhullError"
+    assert numpy_session.run("1 + 1").stdout == "2\n"
+
+
 def test_state_persists(bare: PyodideSession) -> None:
     bare.run("x = 40")
     bare.run("x += 2")
@@ -305,7 +349,7 @@ def test_missing_distribution(tmp_path) -> None:
 # except integer overflow, which wraps silently there too.
 
 NUMERICS_PROBE = """\
-import math, warnings, numpy as np
+import math, warnings, numpy as np, scipy.linalg
 
 def outcome(f, raise_=False):
     with warnings.catch_warnings(record=True) as w:
@@ -335,6 +379,10 @@ cases = {
     "inv singular": lambda: np.linalg.inv(np.zeros((2, 2))),
     "solve singular": lambda: np.linalg.solve(np.zeros((2, 2)), np.ones(2)),
     "cholesky not PD": lambda: np.linalg.cholesky(-np.eye(2)),
+    # scipy checks LAPACK's info code, so these still raise
+    "scipy inv singular": lambda: scipy.linalg.inv(np.zeros((2, 2))),
+    "scipy solve singular": lambda: scipy.linalg.solve(np.zeros((2, 2)), np.ones(2)),
+    "scipy cholesky not PD": lambda: scipy.linalg.cholesky(-np.eye(2)),
     # checked in software, so unaffected
     "int scalar // 0": lambda: np.int64(1) // np.int64(0),
     "python 1.0 / 0": lambda: 1.0 / 0,
@@ -364,6 +412,9 @@ def test_numerics(numpy_session: PyodideSession) -> None:
         "inv singular": "nan",
         "solve singular": "nan",
         "cholesky not PD": "nan",
+        "scipy inv singular": "raises LinAlgError",
+        "scipy solve singular": "raises LinAlgError",
+        "scipy cholesky not PD": "raises LinAlgError",
         "int scalar // 0": "warns",
         "python 1.0 / 0": "raises ZeroDivisionError",
         "math.sqrt(-1)": "raises ValueError",
