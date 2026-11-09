@@ -2,7 +2,8 @@
 
 A pydantic-ai capability, `PyodideRepl`, that gives an agent a persistent, sandboxed
 Python REPL: Pyodide 314.0.7 (Python 3.14) running in its own Deno process, with
-numpy 2.4.6, pandas 3.0.2 and scipy 1.18.0 loaded from local files. Code in a cell
+numpy 2.4.6, pandas 3.0.2, scipy 1.18.0 and statsmodels 0.14.6 loaded from local
+files. Code in a cell
 reads host values (a DataFrame, say) as `host.NAME`. Phase 0 of the plan in
 [Pyodide on Deno as an eryx backend](<Pyodide on Deno as an eryx backend.md>); the
 capability is a port of eryx-test's `EryxRepl`.
@@ -11,7 +12,7 @@ capability is a port of eryx-test's `EryxRepl`.
 from pydantic_ai import Agent
 from pyodide_sandbox import PyodideRepl
 
-# packages=("numpy", "pandas", "scipy", "tzdata") by default
+# packages=("numpy", "pandas", "scipy", "statsmodels", "tzdata") by default
 repl = PyodideRepl(variables={"df": df}, on_change="append")
 agent = Agent("anthropic:claude-sonnet-5-5", capabilities=[repl])
 ```
@@ -30,7 +31,7 @@ That is all the install there is, on Linux, macOS or Windows:
   their modules (`sklearn`, `yaml`) are imported at boot, as the lock file names
   them.
 - **Pyodide** is downloaded when the first session starts: the runtime (14 MB) and
-  the wheels of `packages` with their dependencies (22 MB for the defaults), not the
+  the wheels of `packages` with their dependencies (30 MB for the defaults), not the
   337 MB release. They go to `$PYODIDE_DIST_DIR`, else
   `~/.cache/pyodide-sandbox/314.0.7` (`%LOCALAPPDATA%\pyodide-sandbox\314.0.7` on
   Windows; `$XDG_CACHE_HOME` is respected), and later
@@ -51,7 +52,8 @@ That is all the install there is, on Linux, macOS or Windows:
   dtypes, index, column names and `attrs`. The sandbox reads them with Pyodide's
   pyarrow 22, which is downloaded (10 MB) and loaded only for a store that holds
   one.
-- **Other host values** are pickled. numpy, pandas or scipy objects load reliably
+- **Other host values** are pickled. numpy, pandas, scipy or statsmodels objects
+  (a fitted model, say) load reliably
   only with the sandbox's versions (`SANDBOX_VERSIONS`), so a
   `VersionMismatchWarning` names the value and the version to pin. This also covers
   a frame that Arrow can't convert (mixed-type object columns, duplicate column
@@ -62,7 +64,7 @@ That is all the install there is, on Linux, macOS or Windows:
 ```sh
 uv sync
 uv run poe fetch     # optional; the first session downloads the same files
-uv run poe test      # 122 tests, ~3.5 min; the sandbox ones skip without Deno
+uv run poe test      # 126 tests, ~4.5 min; the sandbox ones skip without Deno
 uv run poe agent     # live demo, needs ANTHROPIC_API_KEY
 ```
 
@@ -109,6 +111,8 @@ exception in the cell.
 | Boot with `tzdata` as well | About +0.2 s. Without it, pandas and `zoneinfo` know no time zones |
 | Boot with `scipy` as well | About +1.7 s (8.2 s for all four). Only `import scipy` runs at boot; the first cell to import `scipy.linalg` and `optimize` pays about 1.9 s more, `stats` about 1.7 s more |
 | Boot with a DataFrame in the store | About +5 s (13.5 s with the default packages), for loading pyarrow: Pyodide compiles libarrow's WebAssembly, and `import pandas` then imports pyarrow. A read then takes 0.1 s. Arrow IPC from pyarrow 26 on the host arrives intact in pyarrow 22 |
+| Boot with `statsmodels` as well | About +1.5 s (11–12 s for all five). Only `import statsmodels` runs at boot; the first cell to import `statsmodels.api` or `statsmodels.formula.api` pays about 5.5 s more |
+| statsmodels | OLS and formulas (patsy), Logit, GLM, MixedLM, ARIMA and SARIMAX (Cython state space), Holt-Winters, lowess and `anova_lm` work. A fitted model pickled on the host loads and predicts in the sandbox |
 | scipy's C and C++ code | qhull, the k-d tree, HiGHS (`linprog`, `milp`), sparse solvers and signal filters work, and their errors are ordinary exceptions |
 | `pyodide.mountNodeFS` under Deno | Reads work. A write, `chmod` or `utime` that reaches Deno is fatal to Pyodide (not used) |
 

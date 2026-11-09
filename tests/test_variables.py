@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import scipy.sparse
+import statsmodels.formula.api as smf
 
 from pyodide_sandbox import PyodideRepl, variables
 from pyodide_sandbox.distribution import SANDBOX_VERSIONS
@@ -179,7 +180,12 @@ def test_no_warning_for_the_sandboxs_versions() -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         VariableStore(
-            {"arr": np.arange(3), "df": weather(), "s": scipy.sparse.eye_array(2)}
+            {
+                "arr": np.arange(3),
+                "df": weather(),
+                "s": scipy.sparse.eye_array(2),
+                "fit": smf.ols("y ~ x", pd.DataFrame({"x": [0, 1], "y": [1, 2]})).fit(),
+            }
         ).close()
 
 
@@ -330,6 +336,9 @@ def store() -> Iterator[VariableStore]:
             "arr": np.arange(6, dtype=np.int64).reshape(2, 3),
             "when": datetime.datetime(2026, 11, 6, 12, 30),
             "sparse": scipy.sparse.csr_array([[0, 2.5], [1, 0]]),
+            "fit": smf.ols(
+                "y ~ x", pd.DataFrame({"x": [0.0, 1, 2], "y": [1.0, 3, 5]})
+            ).fit(),
         }
     ) as store:
         yield store
@@ -374,15 +383,26 @@ def test_plain_values(session: PyodideSession) -> None:
     )
 
 
+def test_fitted_model(session: PyodideSession) -> None:
+    # A statsmodels result pickled on the host, formula (patsy) and all
+    result = session.run(
+        "fit = host.fit\n"
+        "fit.params.round(6).to_dict(), fit.predict({'x': [10.0]}).round(6).tolist()"
+    )
+    assert result.error is None, result.stderr
+    assert result.stdout == "({'Intercept': 1.0, 'x': 2.0}, [21.0])\n"
+
+
 def test_setup_leaves_only_host(session: PyodideSession) -> None:
     result = session.run(
         "[n for n in ('Host', 'pickle', 'json', 'setup_host', 'js', '_from_arrow',"
-        " 'numpy', 'pandas', 'scipy', 'tzdata', 'pyarrow')"
+        " 'numpy', 'pandas', 'scipy', 'statsmodels', 'tzdata', 'pyarrow')"
         " if n in globals()], repr(host)"
     )
     assert result.stdout == (
         "([], 'host variables: x (int), data (dict), df (DataFrame), "
-        "arr (ndarray), when (datetime), sparse (csr_array)')\n"
+        "arr (ndarray), when (datetime), sparse (csr_array), "
+        "fit (RegressionResultsWrapper)')\n"
     )
 
 
@@ -393,7 +413,7 @@ def test_traceback_shows_the_accessor(session: PyodideSession) -> None:
     assert "raise AttributeError(e.args[0]) from None" in result.stderr
     assert result.stderr.endswith(
         "AttributeError: no host variable 'missing'; available: "
-        "x, data, df, arr, when, sparse\n"
+        "x, data, df, arr, when, sparse, fit\n"
     )
 
 

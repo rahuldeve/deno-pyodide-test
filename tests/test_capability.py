@@ -155,7 +155,7 @@ def test_instructions_describe_the_sandbox() -> None:
     assert "Loaded: the standard library only." in bare
     assert "numpy" not in bare
     full = PyodideRepl()._instructions_text()
-    assert "Loaded: numpy, pandas, scipy, tzdata." in full
+    assert "Loaded: numpy, pandas, scipy, statsmodels, tzdata." in full
     assert full.endswith(NUMERICS.format(scipy_linalg=SCIPY_LINALG))
     no_scipy = PyodideRepl(("numpy",))._instructions_text()
     assert no_scipy.endswith(NUMERICS.format(scipy_linalg=""))

@@ -182,7 +182,7 @@ class PyodideRepl(AbstractCapability[Any]):
 
     download: bool = True
     """Download the Pyodide files `packages` need when the first session starts, if
-    they aren't in `dist_dir` yet (about 36 MB for the default packages). With
+    they aren't in `dist_dir` yet (about 44 MB for the default packages). With
     `False`, a missing file fails the start; fetch them ahead of time with
     `python -m pyodide_sandbox fetch`."""
 

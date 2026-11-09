@@ -40,7 +40,7 @@ from pyodide_sandbox.variables import VariableStore
 # main.ts and the Python it runs inside Pyodide, shipped in the package
 DENO_DIR = Path(__file__).resolve().parent / "_deno"
 # tzdata: pandas and zoneinfo find no time zone without it (no system zoneinfo in wasm)
-DEFAULT_PACKAGES = ("numpy", "pandas", "scipy", "tzdata")
+DEFAULT_PACKAGES = ("numpy", "pandas", "scipy", "statsmodels", "tzdata")
 
 # Limits on what Deno sends back; the in-sandbox cap on each stream is the real one
 _MAX_LINE_BYTES = 8 << 20

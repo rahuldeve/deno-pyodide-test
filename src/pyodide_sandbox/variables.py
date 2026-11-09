@@ -27,8 +27,8 @@ isn't a plain scalar.
 
 Everything else is pickled. Unpickling in the sandbox is safe for the host. It needs
 the values' modules in the sandbox and can't load classes defined only on the host.
-A numpy, pandas or scipy object pickled by another version than the sandbox's
-(`distribution.SANDBOX_VERSIONS`) may not load there, so the store warns
+A numpy, pandas, scipy or statsmodels object pickled by another version than the
+sandbox's (`distribution.SANDBOX_VERSIONS`) may not load there, so the store warns
 (`VersionMismatchWarning`) when it pickles one; pin those versions on the host to
 be sure.
 
@@ -67,7 +67,8 @@ from pyodide_sandbox.distribution import SANDBOX_VERSIONS
 
 
 class VersionMismatchWarning(UserWarning):
-    """A value was pickled by another numpy, pandas or scipy than the sandbox has."""
+    """A value was pickled by another numpy, pandas, scipy or statsmodels than the
+    sandbox has."""
 
 
 @dataclass(frozen=True)

@@ -87,6 +87,36 @@ def test_scipy_errors_from_native_code(numpy_session: PyodideSession) -> None:
     assert numpy_session.run("1 + 1").stdout == "2\n"
 
 
+STATSMODELS_CELL = """\
+import numpy as np, pandas as pd
+import statsmodels, statsmodels.api as sm, statsmodels.formula.api as smf
+from statsmodels.tsa.arima.model import ARIMA
+
+rng = np.random.default_rng(0)
+df = pd.DataFrame({"x": rng.normal(size=200), "g": rng.choice(list("abc"), 200)})
+df["y"] = 2 * df.x + 1 + rng.normal(size=200)
+df["hi"] = (df.y > 1).astype(int)
+print(statsmodels.__version__)
+# formulas go through patsy; ARIMA through the Cython state-space code
+print(smf.ols("y ~ x + C(g)", df).fit().params.round(3).tolist())
+print(smf.logit("hi ~ x", df).fit(disp=0).params.round(3).tolist())
+print(sm.GLM(df.hi, sm.add_constant(df.x), family=sm.families.Binomial()).fit().params.round(3).tolist())
+print(ARIMA(np.cumsum(rng.normal(size=100)), order=(1, 1, 0)).fit().params.round(3).tolist())
+"""
+
+
+def test_statsmodels(numpy_session: PyodideSession) -> None:
+    result = numpy_session.run(STATSMODELS_CELL, timeout=60)
+    assert result.error is None, result.stderr
+    assert result.stdout.splitlines() == [
+        "0.14.6",
+        "[0.975, 0.037, 0.013, 1.877]",
+        "[0.033, 4.587]",
+        "[0.033, 4.587]",
+        "[-0.054, 0.807]",
+    ]
+
+
 def test_state_persists(bare: PyodideSession) -> None:
     bare.run("x = 40")
     bare.run("x += 2")
