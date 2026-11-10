@@ -78,7 +78,18 @@ Python arithmetic and `math` still raise as usual. Check computed values with \
 `dtype=np.int64` for large integers."""
 
 SCIPY_LINALG = """ `scipy.linalg`'s `inv`, `solve` and `cholesky` do raise \
-`LinAlgError`, so prefer them."""
+`LinAlgError`, so use them when you need a matrix inverse or solve of your own."""
+
+# What tests/test_session.py::test_statsmodels_facts records
+STATSMODELS = """
+
+Fit statistical models with statsmodels rather than writing the linear algebra \
+yourself: `statsmodels.formula.api` (`smf.ols("y ~ x + C(g)", df)`) or \
+`statsmodels.api` for regression (including regularized fits), GLM, Logit, mixed \
+models and time series (ARIMA, SARIMAX, Holt-Winters). `Logit`, `Probit` and \
+`MNLogit` return NaN standard errors and p-values instead of raising `LinAlgError` \
+when predictors are collinear, so check `np.isfinite(result.bse)` before reading \
+their summaries. The first `import statsmodels.api` takes several seconds."""
 
 
 @dataclass
@@ -322,6 +333,8 @@ class PyodideRepl(AbstractCapability[Any]):
             if "numpy" in self.packages
             else "",
         )
+        if "statsmodels" in self.packages:
+            text += STATSMODELS
         if names := self._host.names():
             listed = ", ".join(f"{n} ({self._host.info(n).type})" for n in names)
             text += (

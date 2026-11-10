@@ -27,7 +27,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai_harness.compaction import ClearToolResults
 
-from pyodide_sandbox.repl import NUMERICS, SCIPY_LINALG, PyodideRepl
+from pyodide_sandbox.repl import NUMERICS, SCIPY_LINALG, STATSMODELS, PyodideRepl
 from pyodide_sandbox.variables import VariableStore
 
 Call = tuple[str, dict[str, object]]
@@ -156,10 +156,11 @@ def test_instructions_describe_the_sandbox() -> None:
     assert "numpy" not in bare
     full = PyodideRepl()._instructions_text()
     assert "Loaded: numpy, pandas, scipy, statsmodels, tzdata." in full
-    assert full.endswith(NUMERICS.format(scipy_linalg=SCIPY_LINALG))
+    assert full.endswith(NUMERICS.format(scipy_linalg=SCIPY_LINALG) + STATSMODELS)
     no_scipy = PyodideRepl(("numpy",))._instructions_text()
     assert no_scipy.endswith(NUMERICS.format(scipy_linalg=""))
     assert "scipy" not in no_scipy
+    assert "statsmodels" not in no_scipy
 
 
 def test_instructions_index_no_cells(make_repl: Callable[..., PyodideRepl]) -> None:

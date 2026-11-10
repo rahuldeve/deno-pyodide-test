@@ -117,6 +117,36 @@ def test_statsmodels(numpy_session: PyodideSession) -> None:
     ]
 
 
+# Recorded facts about statsmodels in the sandbox, which the REPL's instructions
+# repeat (repl.STATSMODELS)
+STATSMODELS_PROBE = """\
+import warnings, numpy as np, pandas as pd, statsmodels.api as sm
+import statsmodels.formula.api as smf
+
+warnings.simplefilter("ignore")
+rng = np.random.default_rng(0)
+df = pd.DataFrame({"a": rng.normal(size=100)})
+df["x2"] = 2 * df.a
+df["hi"] = (df.a + rng.normal(size=100) > 0).astype(int)
+# collinear predictors: native numpy raises LinAlgError for the discrete models
+for name in ["logit", "probit", "mnlogit"]:
+    bse = getattr(smf, name)("hi ~ a + x2", df).fit(disp=0).bse
+    print(name, np.isnan(np.asarray(bse)).all())
+print("glm", np.isfinite(smf.glm("hi ~ a + x2", df, family=sm.families.Binomial()).fit().bse).all())
+"""
+
+
+def test_statsmodels_facts(numpy_session: PyodideSession) -> None:
+    result = numpy_session.run(STATSMODELS_PROBE, timeout=60)
+    assert result.error is None, result.stderr
+    assert result.stdout.splitlines() == [
+        "logit True",
+        "probit True",
+        "mnlogit True",
+        "glm True",
+    ]
+
+
 def test_state_persists(bare: PyodideSession) -> None:
     bare.run("x = 40")
     bare.run("x += 2")
