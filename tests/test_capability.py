@@ -426,9 +426,33 @@ def test_host_variables_survive_a_restart(
     _, timed_out, after = repl.cells
     assert timed_out.error is not None
     assert timed_out.error.endswith(
-        "variables from earlier cells are gone; host variables are unchanged"
+        "variables from earlier cells are gone; host variables are still there"
     )
     assert after.stdout == "(False, 1)\n"
+
+
+def test_host_variable_changes(make_repl: Callable[..., PyodideRepl]) -> None:
+    repl = make_repl(variables={"x": 1, "gone": 0})
+    repl.store.set("early", 0)  # before any cell: nothing to mark
+    first = Script(run_cells("x = host.x", "x"))
+    make_agent(repl, first).run_sync("go")
+    assert "Host variables (read-only): x (int), gone (int), early (int)." in (
+        instructions(first)
+    )
+    assert "changed since" not in instructions(first)
+
+    repl.store.update(x=2.5, y="new")
+    repl.store.remove("gone")
+    second = Script(run_cells("x, host.x, host.y"))
+    make_agent(repl, second).run_sync("go")
+
+    assert repl.cells[-1].stdout == "(1, 2.5, 'new')\n"
+    text = instructions(second)
+    assert (
+        "Host variables (read-only): x (float, changed since cell 2), "
+        "early (int), y (str, changed since cell 2)."
+    ) in text
+    assert "One changed since cell N was set after that cell started" in text
 
 
 def test_shared_store(make_repl: Callable[..., PyodideRepl]) -> None:

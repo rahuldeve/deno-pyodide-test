@@ -9,7 +9,9 @@
 - `repl_history` returns the code of earlier cells, and their output on request.
 
 With `variables=` (or a shared `store=`), code in a cell reads host values as
-`host.NAME` (see `pyodide_sandbox.variables`).
+`host.NAME` (see `pyodide_sandbox.variables`). The host can change them while the
+REPL runs (`repl.store.set(...)`): the instructions list the current variables and
+mark those changed after a cell the model ran, so it knows to read them again.
 
 Every cell is kept on the host, and the instructions carry an index of them built
 from that record rather than from the conversation. So whatever a compaction
@@ -41,7 +43,11 @@ from pydantic_ai.agent import AbstractAgent
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import InstructionChangePolicy, InstructionPart
 
-from pyodide_sandbox.distribution import PYTHON_VERSION, loaded_packages
+from pyodide_sandbox.distribution import (
+    PYTHON_VERSION,
+    DistributionError,
+    loaded_packages,
+)
 from pyodide_sandbox.session import (
     DEFAULT_PACKAGES,
     PyodideSession,
@@ -106,6 +112,8 @@ class Cell:
     error: str | None
     """The exception type for code that raised, or why the sandbox stopped it."""
     duration_ms: float
+    store_generation: int = 0
+    """The store's `generation` when the cell started."""
 
     def output(self) -> str:
         parts = [self.stdout, self.stderr]
@@ -132,7 +140,7 @@ class PyodideRepl(AbstractCapability[Any]):
     next cell starts a new one, without the earlier variables. If a session can't
     start, `run_code` raises `RuntimeError`, which ends the run. Every new session
     gives the cells `host`, reading `store`; host values live on the host, so they
-    survive restarts.
+    survive restarts, and changes to `store` reach the running session.
 
     An instance belongs to the first agent it is given to; another agent gets a
     `ValueError`. It should also serve one conversation at a time, which isn't
@@ -152,12 +160,13 @@ class PyodideRepl(AbstractCapability[Any]):
     """Host values the model reads as `host.NAME` (see `pyodide_sandbox.variables`).
 
     `None` creates one from `variables`. A store passed in belongs to the caller,
-    and can be shared by several REPLs. It can't be replaced afterwards."""
+    and can be shared by several REPLs. It can't be replaced afterwards, but its
+    values can be changed (`store.set`, `update`, `remove`) at any time."""
 
     variables: InitVar[Mapping[str, Any] | None] = None
     """Shorthand for `store=VariableStore(variables)`. The values are copied and
-    pickled when the capability is created, so later changes on the host aren't
-    seen. Unpickling happens in the sandbox, when a cell reads one, so it needs the
+    pickled when the capability is created, so later changes to the objects on the
+    host aren't seen; change them through `store` instead. Unpickling happens in the sandbox, when a cell reads one, so it needs the
     values' modules (e.g. pandas, among `packages`) and can't load classes defined
     only on the host. Only an init argument: read `store` afterwards, as this
     attribute stays `None`."""
@@ -367,12 +376,24 @@ class PyodideRepl(AbstractCapability[Any]):
         if "statsmodels" in loaded:
             text += STATSMODELS
         if names := self._host.names():
-            listed = ", ".join(f"{n} ({self._host.info(n).type})" for n in names)
+            entries = [self._host.info(n) for n in names]
+            changed = {e.name: self._changed_since(e.generation) for e in entries}
+            listed = ", ".join(
+                f"{e.name} ({e.type}"
+                + (f", changed since cell {n})" if (n := changed[e.name]) else ")")
+                for e in entries
+            )
             text += (
                 f"\n\nHost variables (read-only): {listed}. Read one with "
                 f"`host.NAME`, e.g. `{names[0]} = host.{names[0]}`; each read "
                 "returns a fresh copy."
             )
+            if any(changed.values()):
+                text += (
+                    " The host may add, replace or remove them between your calls. "
+                    "One changed since cell N was set after that cell started: read "
+                    "it again rather than using a copy made before."
+                )
         if not self._cells:
             return text
         # -0 would slice from the start and list every cell
@@ -381,6 +402,13 @@ class PyodideRepl(AbstractCapability[Any]):
         if earlier := len(self._cells) - len(shown):
             lines.insert(0, f"({earlier} earlier cells, see repl_history)")
         return text + "\n\nCells run so far:\n" + "\n".join(lines)
+
+    def _changed_since(self, generation: int) -> int | None:
+        """The last cell that started before the store's `generation`, if any."""
+        for cell in reversed(self._cells):
+            if cell.store_generation < generation:
+                return cell.number
+        return None
 
     def _get_session(self) -> PyodideSession:
         if self._session is None or not self._session.alive:
@@ -416,7 +444,7 @@ class PyodideRepl(AbstractCapability[Any]):
         self._close_session()
         note = "; the sandbox was restarted and variables from earlier cells are gone"
         if self._host.names():
-            note += "; host variables are unchanged"
+            note += "; host variables are still there"
         return note
 
     def _execute(self, code: str) -> Cell:
@@ -429,10 +457,18 @@ class PyodideRepl(AbstractCapability[Any]):
                 else self.execution_timeout_ms / 1000
             )
             stdout = stderr = ""
+            # before the cell, so a change during it counts as after it started
+            generation = self._host.generation
             start = time.perf_counter()
             try:
                 result = session.run(code, timeout=timeout, cell_id=number)
                 stdout, stderr, error = result.stdout, result.stderr, result.error
+            except DistributionError as e:
+                # pyarrow for a DataFrame added since the start; as for the start,
+                # a host problem, not the model's
+                raise RuntimeError(
+                    f"loading the packages the host variables need failed: {e}"
+                ) from e
             except SessionTimeout:
                 error = (
                     f"timed out after {self.execution_timeout_ms} ms" + self._restart()
@@ -446,6 +482,7 @@ class PyodideRepl(AbstractCapability[Any]):
                 stderr=stderr,
                 error=error,
                 duration_ms=(time.perf_counter() - start) * 1000,
+                store_generation=generation,
             )
             self._cells.append(cell)
             return cell
