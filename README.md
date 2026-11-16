@@ -24,6 +24,19 @@ the packages' slow submodules (`scipy.stats`, `statsmodels.api`; the list is in
 `_deno/warmup.py`), so the first cell to use them doesn't pay for that:
 `warm_imports=False` turns it off.
 
+The host can change the variables while the REPL runs, and the next read in a cell
+sees the change:
+
+```python
+repl.store.set("df", new_df)          # add or replace one
+repl.store.update(df=new_df, n=10)    # several at once: a cell sees all or none
+repl.store.remove("n")
+```
+
+The instructions list the current variables, and mark one that changed after a cell
+started (`df (DataFrame, changed since cell 3)`), so the model knows that a copy it
+made earlier is stale. Cells still can't change the store.
+
 ## Using it as a library
 
 ```sh
@@ -58,7 +71,8 @@ That is all the install there is, on Linux, macOS or Windows:
   pyarrow (`pyodide-sandbox[arrow]`), so any host pandas works. They keep their
   dtypes, index, column names and `attrs`. The sandbox reads them with Pyodide's
   pyarrow 22, which is downloaded (10 MB) and loaded only for a store that holds
-  one.
+  one. If the first one is added after the session started, pyarrow is loaded
+  (about 5 s) before the next cell.
 - **Other host values** are pickled. numpy, pandas, scipy or statsmodels objects
   (a fitted model, say) load reliably
   only with the sandbox's versions (`SANDBOX_VERSIONS`), so a
@@ -81,11 +95,11 @@ uv run poe agent     # live demo, needs ANTHROPIC_API_KEY
 |---|---|
 | `src/pyodide_sandbox/repl.py` | `PyodideRepl`: `run_code`, `repl_history`, the cell index in the instructions, restart on timeout or crash |
 | `src/pyodide_sandbox/session.py` | `PyodideSession`: starts and kills the Deno process, speaks JSON lines, checks every reply |
-| `src/pyodide_sandbox/variables.py` | `VariableStore`: host values (DataFrames as Arrow, the rest pickled) in a temporary directory that only the session's Deno can read, and only read |
+| `src/pyodide_sandbox/variables.py` | `VariableStore`: host values (DataFrames as Arrow, the rest pickled) in a temporary directory that only the session's Deno can read, and only read; the host changes it by replacing `view.json` in one rename |
 | `src/pyodide_sandbox/distribution.py` | Downloads and checks the Pyodide files the packages need; `python -m pyodide_sandbox fetch` |
 | `src/pyodide_sandbox/_deno/main.ts` | Imports Pyodide from those files (no npm), loads it and the packages, captures each cell's stdout and stderr (including C-level writes), caps them at 1 MB |
 | `src/pyodide_sandbox/_deno/runner.py` | Runs a cell in Pyodide: `CodeRunner` as `<cell-N>`, echoes the last expression's `repr`, trims tracebacks to the cell's frames |
-| `src/pyodide_sandbox/_deno/host.py` | The `host` object in the sandbox: reads the store's `view.json` and unpickles a value on every read, so each read is a fresh copy |
+| `src/pyodide_sandbox/_deno/host.py` | The `host` object in the sandbox: reads the store's `view.json` and unpickles a value on every read, so each read is a fresh copy of the current value |
 
 Deno runs with `--no-prompt --cached-only --no-remote --allow-read=<_deno>,<Pyodide files>,<store>`,
 so it has no network, write, subprocess, FFI or env access. It gets none of the host's
