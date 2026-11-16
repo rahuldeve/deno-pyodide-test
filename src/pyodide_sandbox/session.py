@@ -86,7 +86,8 @@ class PyodideSession:
 
     Not thread-safe: run one cell at a time. After `SessionError` the session is
     dead and every later call raises it again. With `store`, cells read its values
-    as `host.NAME`; the session keeps the store open while it holds it. With
+    as `host.NAME`, and see the host's changes to it; the session keeps the store
+    open while it holds it. With
     `warm_imports`, the boot also imports the packages' slow submodules
     (`_deno/warmup.py`), so the first cell to use them doesn't.
     """
@@ -115,6 +116,8 @@ class PyodideSession:
         self._stderr_tail: deque[str] = deque(maxlen=_STDERR_TAIL_LINES)
         self._next_id = 0
         self._dead: SessionError | None = None
+        # loaded for the store beyond `packages` (pyarrow), at boot or since
+        self._store_packages: set[str] = set()
 
     def _command(self, root: Path) -> list[str]:
         """Deno's command line; `root` holds the Pyodide files, with the lock file."""
@@ -170,6 +173,7 @@ class PyodideSession:
             (*self.packages, *self._load_only()), self.dist_dir, download=self.download
         )
         command = self._command(root)
+        self._store_packages = set(self._load_only())
         start = time.perf_counter()
         self._proc = subprocess.Popen(
             command,
@@ -202,7 +206,12 @@ class PyodideSession:
     def run(
         self, code: str, timeout: float | None = None, cell_id: int | None = None
     ) -> CellResult:
-        """Run a cell; `cell_id` names it in tracebacks (`<cell-N>`), and must increase."""
+        """Run a cell; `cell_id` names it in tracebacks (`<cell-N>`), and must increase.
+
+        If the store gained a value that needs a package the session hasn't loaded
+        (pyarrow, for a DataFrame added after boot), loads it first, downloading it
+        if need be (`DistributionError`). The load has a `timeout` of its own.
+        """
         if self._proc is None:
             raise RuntimeError("session not started")
         if self._dead is not None:
@@ -211,14 +220,9 @@ class PyodideSession:
             cell_id = self._next_id + 1
         if cell_id <= self._next_id:
             raise ValueError(f"cell_id must be > {self._next_id}, got {cell_id}")
+        self._load_store_packages(timeout)
         self._next_id = cell_id
-        request = json.dumps({"id": cell_id, "op": "run", "code": code}) + "\n"
-        assert self._proc.stdin
-        try:
-            self._proc.stdin.write(request.encode())
-            self._proc.stdin.flush()
-        except (BrokenPipeError, OSError):
-            raise self._die(SessionCrashed, "the sandbox process is gone") from None
+        self._send({"id": cell_id, "op": "run", "code": code})
         reply = self._wait(lambda m: m.get("id") == cell_id, timeout, "cell")
         error, stdout, stderr = (
             reply.get("error"),
@@ -234,6 +238,27 @@ class PyodideSession:
         ):
             raise self._die(SessionCrashed, "malformed reply from the sandbox")
         return CellResult(error, stdout, stderr, float(duration))
+
+    def _load_store_packages(self, timeout: float | None) -> None:
+        missing = [p for p in self._load_only() if p not in self._store_packages]
+        if not missing:
+            return
+        ensure_distribution(
+            (*self.packages, *self._store_packages, *missing),
+            self.dist_dir,
+            download=self.download,
+        )
+        self._send({"op": "load", "packages": missing})
+        self._wait(lambda m: m.get("op") == "loaded", timeout, "package load")
+        self._store_packages.update(missing)
+
+    def _send(self, message: dict[str, Any]) -> None:
+        assert self._proc and self._proc.stdin
+        try:
+            self._proc.stdin.write((json.dumps(message) + "\n").encode())
+            self._proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            raise self._die(SessionCrashed, "the sandbox process is gone") from None
 
     def close(self) -> None:
         if self._proc is not None:

@@ -1,11 +1,13 @@
 // One Pyodide REPL session, driven over JSON lines by the Python host (PyodideSession).
 //
 //   host -> deno (stdin):   {"id": 1, "op": "run", "code": "..."}
+//                           {"op": "load", "packages": ["pyarrow"]} between cells
 //   deno -> host (stdout):  {"op": "ready", "boot_ms": ...} once, then per cell
 //                           {"id": 1, "error": null | "ZeroDivisionError",
 //                            "stdout": "...", "stderr": "...", "duration_ms": ...}
-//                           or, when Pyodide can't go on, {"op": "fatal", "message": "..."}
-//                           just before the process exits (code 70)
+//                           per load {"op": "loaded"}, or, when Pyodide can't go on,
+//                           {"op": "fatal", "message": "..."} just before the process
+//                           exits (code 70)
 //
 // Stdout carries nothing but these messages: console.log is sent to stderr, and so
 // is Pyodide's own output outside a cell. The host enforces the time limit by
@@ -24,6 +26,9 @@
 // their slow submodules (`scipy.stats`, `statsmodels.api`), unless --no-warmup.
 //
 // With --store, cells read the host's variables in DIR as `host.NAME` (runner.setup_host).
+// A "load" adds a package the store came to need after boot (pyarrow, when the host
+// adds a DataFrame); a failure goes to stderr, and the cell reading the value then
+// gets an ImportError.
 
 import { pathToFileURL } from "node:url";
 
@@ -122,12 +127,13 @@ const pyodide = await loadPyodide({
   stdout: (msg: string) => console.error(msg),
   stderr: (msg: string) => console.error(msg),
 });
-if (args.packages.length) {
-  await pyodide.loadPackage(args.packages, {
+async function loadPackages(names: string[]): Promise<void> {
+  await pyodide.loadPackage(names, {
     messageCallback: () => {},
     errorCallback: (msg: string) => console.error(msg),
   });
 }
+if (args.packages.length) await loadPackages(args.packages);
 
 const runnerSource = await Deno.readTextFile(
   new URL("./runner.py", import.meta.url),
@@ -194,7 +200,16 @@ await send({ op: "ready", boot_ms: performance.now() - t0 });
 
 for await (const line of readLines(Deno.stdin.readable)) {
   if (!line.trim()) continue;
-  const request = JSON.parse(line); // the host only sends {"op": "run"}
+  const request = JSON.parse(line); // from the host: "run" or "load"
+  if (request.op === "load") {
+    try {
+      await loadPackages(request.packages);
+    } catch (e) {
+      console.error(`pyodide-sandbox: loading ${request.packages}: ${describe(e)}`);
+    }
+    await send({ op: "loaded" });
+    continue;
+  }
   // Output written between cells (by a task a cell left running) is not this cell's
   stdout.take();
   stderr.take();

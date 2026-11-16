@@ -651,6 +651,27 @@ def test_session_reads_while_the_host_writes() -> None:
             session.close()
 
 
+def test_a_dataframe_added_after_boot_loads_pyarrow() -> None:
+    with VariableStore({"x": 1}) as store:
+        session = PyodideSession((), store=store)
+        session.start()
+        try:
+            check = "import sys; 'pyarrow' in sys.modules, 'pandas' in sys.modules"
+            assert session.run(check).stdout == "(False, False)\n"
+            values = {"df": weather(), "series": pd.Series([1.5, None], name="t")}
+            store.update(values)
+            result = session.run(
+                f"{inspect.getsource(describe)}\n"
+                "{n: describe(host[n]) for n in ('df', 'series')}"
+            )
+            assert result.error is None, result.stderr
+            described = {n: describe(v) for n, v in values.items()}
+            assert result.stdout == repr(described) + "\n"
+            assert session.run(check).stdout == "(True, True)\n"
+        finally:
+            session.close()
+
+
 def test_no_store_means_no_host() -> None:
     session = PyodideSession(())
     session.start()
