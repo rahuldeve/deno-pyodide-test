@@ -8,8 +8,10 @@ import asyncio
 import copy
 import dataclasses
 import gc
+import json
 import warnings
 from collections.abc import Callable, Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -27,6 +29,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai_harness.compaction import ClearToolResults
 
+from pyodide_sandbox.distribution import LOCK_FILE
 from pyodide_sandbox.repl import NUMERICS, SCIPY_LINALG, STATSMODELS, PyodideRepl
 from pyodide_sandbox.variables import VariableStore
 
@@ -161,6 +164,26 @@ def test_instructions_describe_the_sandbox() -> None:
     assert no_scipy.endswith(NUMERICS.format(scipy_linalg=""))
     assert "scipy" not in no_scipy
     assert "statsmodels" not in no_scipy
+
+
+def test_instructions_follow_what_is_loaded(tmp_path: Path) -> None:
+    lock = {
+        "numpy": {"depends": []},
+        "scipy": {"depends": ["numpy"]},
+        "statsmodels": {"depends": ["numpy", "scipy"]},
+        "linearmodels": {"depends": ["statsmodels"]},
+    }
+    (tmp_path / LOCK_FILE).write_text(json.dumps({"packages": lock}))
+    everything = NUMERICS.format(scipy_linalg=SCIPY_LINALG) + STATSMODELS
+    # dependencies count, and so do names the session would canonicalise
+    for packages in [("statsmodels",), ("Statsmodels",), ("linearmodels",)]:
+        text = PyodideRepl(packages, dist_dir=tmp_path)._instructions_text()
+        assert text.endswith(everything), packages
+    scipy = PyodideRepl(("SciPy",), dist_dir=tmp_path)._instructions_text()
+    assert scipy.endswith(NUMERICS.format(scipy_linalg=SCIPY_LINALG))
+    # before the first session downloads the lock file, only the names are known
+    early = PyodideRepl(("Statsmodels",), dist_dir=tmp_path / "empty")
+    assert early._instructions_text().endswith(STATSMODELS)
 
 
 def test_instructions_index_no_cells(make_repl: Callable[..., PyodideRepl]) -> None:

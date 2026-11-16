@@ -123,16 +123,32 @@ STATSMODELS_PROBE = """\
 import warnings, numpy as np, pandas as pd, statsmodels.api as sm
 import statsmodels.formula.api as smf
 
-warnings.simplefilter("ignore")
 rng = np.random.default_rng(0)
 df = pd.DataFrame({"a": rng.normal(size=100)})
 df["x2"] = 2 * df.a
 df["hi"] = (df.a + rng.normal(size=100) > 0).astype(int)
+df["cnt"] = rng.poisson(np.exp(0.3 * df.a))
+
+def fit(name, y, **kwargs):
+    # with the warnings it gave, which stay out of the session's own filters
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        result = getattr(smf, name)(y + " ~ a + x2", df, **kwargs).fit(disp=0)
+    return result, sorted({x.category.__name__ for x in w}) or "silent"
+
 # collinear predictors: native numpy raises LinAlgError for the discrete models
-for name in ["logit", "probit", "mnlogit"]:
-    bse = getattr(smf, name)("hi ~ a + x2", df).fit(disp=0).bse
-    print(name, np.isnan(np.asarray(bse)).all())
-print("glm", np.isfinite(smf.glm("hi ~ a + x2", df, family=sm.families.Binomial()).fit().bse).all())
+for name, y in [("logit", "hi"), ("probit", "hi"), ("mnlogit", "hi"), ("poisson", "cnt")]:
+    result, warned = fit(name, y)
+    print(name, np.isnan(np.asarray(result.bse)).all(), warned)
+# some fits come back with finite but meaningless standard errors instead
+result, warned = fit("negativebinomial", "cnt")
+bse = np.asarray(result.bse)
+print("negativebinomial", np.isfinite(bse).all(), bse.max() > 1e3, warned)
+# which the rank of the design matrix catches either way
+exog = result.model.exog
+print("rank", np.linalg.matrix_rank(exog), exog.shape[1])
+result, warned = fit("glm", "hi", family=sm.families.Binomial())
+print("glm", np.isfinite(result.bse).all(), warned)
 """
 
 
@@ -140,10 +156,13 @@ def test_statsmodels_facts(numpy_session: PyodideSession) -> None:
     result = numpy_session.run(STATSMODELS_PROBE, timeout=60)
     assert result.error is None, result.stderr
     assert result.stdout.splitlines() == [
-        "logit True",
-        "probit True",
-        "mnlogit True",
-        "glm True",
+        "logit True silent",
+        "probit True silent",
+        "mnlogit True silent",
+        "poisson True silent",
+        "negativebinomial True True silent",
+        "rank 2 3",
+        "glm True silent",
     ]
 
 

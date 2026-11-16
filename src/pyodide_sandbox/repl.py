@@ -41,7 +41,7 @@ from pydantic_ai.agent import AbstractAgent
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import InstructionChangePolicy, InstructionPart
 
-from pyodide_sandbox.distribution import PYTHON_VERSION
+from pyodide_sandbox.distribution import PYTHON_VERSION, loaded_packages
 from pyodide_sandbox.session import (
     DEFAULT_PACKAGES,
     PyodideSession,
@@ -86,10 +86,13 @@ STATSMODELS = """
 Fit statistical models with statsmodels rather than writing the linear algebra \
 yourself: `statsmodels.formula.api` (`smf.ols("y ~ x + C(g)", df)`) or \
 `statsmodels.api` for regression (including regularized fits), GLM, Logit, mixed \
-models and time series (ARIMA, SARIMAX, Holt-Winters). `Logit`, `Probit` and \
-`MNLogit` return NaN standard errors and p-values instead of raising `LinAlgError` \
-when predictors are collinear, so check `np.isfinite(result.bse)` before reading \
-their summaries. The first `import statsmodels.api` takes several seconds."""
+models and time series (ARIMA, SARIMAX, Holt-Winters). Collinear predictors don't raise \
+`LinAlgError` or warn in the maximum-likelihood models (`Logit`, `Probit`, \
+`MNLogit`, `Poisson`, `NegativeBinomial` and the like): standard errors and \
+p-values come back NaN, or finite but huge and meaningless. Before reading such a \
+summary, check that `np.linalg.matrix_rank(result.model.exog)` equals \
+`result.model.exog.shape[1]` and that `np.isfinite(np.asarray(result.bse)).all()` \
+is true. The first `import statsmodels.api` takes several seconds."""
 
 
 @dataclass
@@ -324,16 +327,19 @@ class PyodideRepl(AbstractCapability[Any]):
         return text
 
     def _instructions_text(self) -> str:
+        # What the session loads, not what `packages` spells: statsmodels brings
+        # numpy and scipy with it, and `Statsmodels` loads too
+        loaded = loaded_packages(self.packages, self.dist_dir)
         text = INSTRUCTIONS.format(
             python=PYTHON_VERSION,
             packages=", ".join(self.packages) or "the standard library only",
             numerics=NUMERICS.format(
-                scipy_linalg=SCIPY_LINALG if "scipy" in self.packages else ""
+                scipy_linalg=SCIPY_LINALG if "scipy" in loaded else ""
             )
-            if "numpy" in self.packages
+            if "numpy" in loaded
             else "",
         )
-        if "statsmodels" in self.packages:
+        if "statsmodels" in loaded:
             text += STATSMODELS
         if names := self._host.names():
             listed = ", ".join(f"{n} ({self._host.info(n).type})" for n in names)

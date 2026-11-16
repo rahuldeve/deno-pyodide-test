@@ -171,6 +171,22 @@ def import_names(
     return names
 
 
+def loaded_packages(
+    packages: Iterable[str], dist_dir: str | Path | None = None
+) -> set[str]:
+    """`packages` and their dependencies, by their names in the lock file.
+
+    Just `packages`' own names in that form while `dist_dir` has no lock file yet
+    (nothing is downloaded here), or when one of them isn't in it.
+    """
+    packages = list(packages)
+    root = Path(dist_dir) if dist_dir is not None else default_dist_dir()
+    try:
+        return set(_with_dependencies(_read_lock(root), packages))
+    except (DistributionError, ValueError):
+        return {_canonical(name) for name in packages}
+
+
 def _canonical(name: str) -> str:
     """A package name as the lock file has it (PEP 503): `PyYAML` is `pyyaml`."""
     return re.sub(r"[-_.]+", "-", name).lower()
