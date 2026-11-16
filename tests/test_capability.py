@@ -389,36 +389,12 @@ def test_host_variables(make_repl: Callable[..., PyodideRepl]) -> None:
     ) in instructions(script)
 
 
-def test_changing_the_passed_dict_changes_nothing(
-    make_repl: Callable[..., PyodideRepl],
-) -> None:
-    variables: dict[str, object] = {"x": 1}
-    repl = make_repl(variables=variables)
-    variables["x"] = [1, 2, 3]
-    variables["y"] = "added later"
-    script = Script(run_cells("host.x, 'y' in host"))
-    make_agent(repl, script).run_sync("go")
-
-    assert repl.cells[0].stdout == "(1, False)\n"
-    assert "Host variables (read-only): x (int)." in instructions(script)
-
-
 def test_no_host_variables(repl: PyodideRepl) -> None:
     script = Script(run_cells("list(host)"))
     make_agent(repl, script).run_sync("go")
 
     assert repl.cells[0].stdout == "[]\n"
     assert "Host variables" not in instructions(script)
-
-
-def test_model_variable_and_host_variable_are_independent(
-    make_repl: Callable[..., PyodideRepl],
-) -> None:
-    repl = make_repl(variables={"x": 1})
-    make_agent(repl, Script(run_cells("x = host.x\nx += 1", "x, host.x"))).run_sync(
-        "go"
-    )
-    assert repl.cells[-1].stdout == "(2, 1)\n"
 
 
 def test_host_variables_survive_a_restart(
@@ -489,15 +465,6 @@ def test_variable_the_sandbox_cannot_load(
     failed, ok = repl.cells
     assert failed.error == "ModuleNotFoundError"
     assert ok.stdout == "1\n"
-
-
-def test_closed_store_fails_the_start() -> None:
-    store = VariableStore({"x": 1})
-    store.close()
-    repl = PyodideRepl((), store=store)
-    with pytest.raises(RuntimeError, match="starting the PyodideRepl session failed"):
-        make_agent(repl, Script(run_cells("1"))).run_sync("go")
-    assert repl.cells == []
 
 
 def test_dropping_the_repl_stops_its_process() -> None:

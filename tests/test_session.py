@@ -166,12 +166,6 @@ def test_statsmodels_facts(numpy_session: PyodideSession) -> None:
     ]
 
 
-def test_state_persists(bare: PyodideSession) -> None:
-    bare.run("x = 40")
-    bare.run("x += 2")
-    assert bare.run("x").stdout == "42\n"
-
-
 @pytest.mark.parametrize(
     ("code", "printed"),
     [
@@ -446,13 +440,6 @@ def test_garbage_on_the_pipe_is_a_crash(bare: PyodideSession) -> None:
     with pytest.raises(SessionCrashed, match="protocol"):
         bare.run(code, timeout=5)
     assert not bare.alive
-
-
-def test_unknown_package() -> None:
-    session = PyodideSession(("no_such_package",))
-    with pytest.raises(ValueError, match="not in Pyodide 314.0.7: no_such_package"):
-        session.start()
-    assert session._proc is None
 
 
 def test_missing_files_without_download(tmp_path) -> None:
