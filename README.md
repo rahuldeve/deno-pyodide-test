@@ -86,7 +86,7 @@ That is all the install there is, on Linux, macOS or Windows:
 uv sync
 uv run poe fetch     # optional; the first session downloads the same files
 uv run poe test      # 126 tests, ~4.5 min; the sandbox ones skip without Deno
-uv run poe agent     # live demo, needs ANTHROPIC_API_KEY
+uv run poe agent     # live demo on OpenRouter, needs OPENROUTER_API_KEY (AGENT_MODEL picks the model)
 ```
 
 ## How it fits together

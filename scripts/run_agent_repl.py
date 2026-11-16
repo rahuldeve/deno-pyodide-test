@@ -9,20 +9,28 @@ find them through the cell index in the instructions and `repl_history`.
 Instruction changes are appended (`on_change="append"`), so the prompt cache
 survives each new cell.
 
-Needs ANTHROPIC_API_KEY (or set AGENT_MODEL to another pydantic-ai model).
+Runs on OpenRouter and needs OPENROUTER_API_KEY, read from the environment or from
+`.env.secret` at the repo root (gitignored; the environment wins). Set AGENT_MODEL to
+pick another OpenRouter model (`openrouter:<provider>/<model>`) or any other
+pydantic-ai model string. OpenRouter has no automatic prompt caching, so the
+agent turns it on with the `cache` model setting; routes that can't cache ignore it.
 """
 
 import os
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from dotenv import load_dotenv
 from pydantic_ai import Agent, capture_run_messages
 from pydantic_ai.messages import ModelRequest, ToolReturnPart
 from pydantic_ai_harness.compaction import ClearToolResults
 
 from pyodide_sandbox import PyodideRepl
 
-MODEL = os.environ.get("AGENT_MODEL", "anthropic:claude-sonnet-5-5")
+load_dotenv(Path(__file__).resolve().parent.parent / ".env.secret")
+
+MODEL = os.environ.get("AGENT_MODEL", "openrouter:nvidia/nemotron-3-ultra-550b-a55b:free")
 CLEARED = "[tool result cleared]"  # ClearToolResults' default placeholder
 
 
@@ -63,6 +71,7 @@ def main() -> None:
         MODEL,
         instructions="Answer questions about the data by running code in the REPL.",
         capabilities=[ClearToolResults(max_messages=6, keep_pairs=2), repl],
+        model_settings={"cache": True},
     )
 
     history = None
