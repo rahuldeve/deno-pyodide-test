@@ -347,6 +347,25 @@ def test_session_that_cannot_start() -> None:
     assert repl.cells == []
 
 
+def test_warm_up_starts_the_session_the_first_cell_uses(repl: PyodideRepl) -> None:
+    repl.warm_up()
+    repl.warm_up()  # a second call finds the first one's session
+    make_agent(repl, Script(run_cells("x = 1"))).run_sync("go")
+    session = repl.session
+    assert session is not None and session.alive
+    repl.warm_up()
+    make_agent(repl, Script(run_cells("x"))).run_sync("go")
+    assert repl.session is session
+    assert [c.error for c in repl.cells] == [None, None]
+
+
+def test_warm_up_that_fails_leaves_the_error_to_the_first_cell() -> None:
+    repl = PyodideRepl(("no_such_package",))
+    repl.warm_up()
+    with pytest.raises(RuntimeError, match="starting the PyodideRepl session failed"):
+        make_agent(repl, Script(run_cells("1"))).run_sync("go")
+
+
 def test_reset(repl: PyodideRepl) -> None:
     make_agent(repl, Script(run_cells("x = 1"))).run_sync("go")
     first = repl.session

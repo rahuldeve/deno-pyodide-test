@@ -17,6 +17,13 @@ repl = PyodideRepl(variables={"df": df}, on_change="append")
 agent = Agent("anthropic:claude-sonnet-5-5", capabilities=[repl])
 ```
 
+The session starts on the first `run_code` call, which then waits for the boot.
+`repl.warm_up()` starts it in the background instead, e.g. when a conversation
+opens, so that it boots while the model writes its first cell. The boot also imports
+the packages' slow submodules (`scipy.stats`, `statsmodels.api`; the list is in
+`_deno/warmup.py`), so the first cell to use them doesn't pay for that:
+`warm_imports=False` turns it off.
+
 ## Using it as a library
 
 ```sh
@@ -112,6 +119,7 @@ exception in the cell.
 | Boot with `scipy` as well | About +1.7 s (8.2 s for all four). Only `import scipy` runs at boot; the first cell to import `scipy.linalg` and `optimize` pays about 1.9 s more, `stats` about 1.7 s more |
 | Boot with a DataFrame in the store | About +5 s (13.5 s with the default packages), for loading pyarrow: Pyodide compiles libarrow's WebAssembly, and `import pandas` then imports pyarrow. A read then takes 0.1 s. Arrow IPC from pyarrow 26 on the host arrives intact in pyarrow 22 |
 | Boot with `statsmodels` as well | About +1.5 s (11–12 s for all five). Only `import statsmodels` runs at boot; the first cell to import `statsmodels.api` or `statsmodels.formula.api` pays about 5.5 s more |
+| Warm imports (`_deno/warmup.py`) | About +4.8 s of boot with the default packages. The first cell to import `statsmodels.api` and `scipy.stats`, `optimize` and `linalg` then takes 0.02 s instead of 4.9 s, so the first-cell costs in the scipy and statsmodels rows are those of `warm_imports=False` |
 | statsmodels | OLS and formulas (patsy), Logit, GLM, MixedLM, ARIMA and SARIMAX (Cython state space), Holt-Winters, lowess and `anova_lm` work. A fitted model pickled on the host loads and predicts in the sandbox |
 | scipy's C and C++ code | qhull, the k-d tree, HiGHS (`linprog`, `milp`), sparse solvers and signal filters work, and their errors are ordinary exceptions |
 | `pyodide.mountNodeFS` under Deno | Reads work. A write, `chmod` or `utime` that reaches Deno is fatal to Pyodide (not used) |

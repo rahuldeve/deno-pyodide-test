@@ -126,8 +126,8 @@ class Cell:
 class PyodideRepl(AbstractCapability[Any]):
     """Capability giving the model a persistent, sandboxed Python REPL (see module docs).
 
-    The session (one Deno process) starts on the first `run_code` call and is kept,
-    with the cell history, until `reset()`. A cell that runs past
+    The session (one Deno process) starts on the first `run_code` call, or ahead of
+    it with `warm_up()`, and is kept, with the cell history, until `reset()`. A cell that runs past
     `execution_timeout_ms`, or that crashes the process, gets the process killed; the
     next cell starts a new one, without the earlier variables. If a session can't
     start, `run_code` raises `RuntimeError`, which ends the run. Every new session
@@ -200,6 +200,12 @@ class PyodideRepl(AbstractCapability[Any]):
     `False`, a missing file fails the start; fetch them ahead of time with
     `python -m pyodide_sandbox fetch`."""
 
+    warm_imports: bool = True
+    """Import the packages' slow submodules (`scipy.stats`, `statsmodels.api`; see
+    `_deno/warmup.py`) when a session starts. That takes about 5 s for the default
+    packages, which the first cell to use them would otherwise pay. Call `warm_up()`
+    to have it done before the first cell."""
+
     _session: PyodideSession | None = field(default=None, init=False, repr=False)
     _cells: list[Cell] = field(default_factory=list, init=False, repr=False)
     # held while a cell runs, so a cancelled cell can't overlap the next one
@@ -256,6 +262,25 @@ class PyodideRepl(AbstractCapability[Any]):
     def session(self) -> PyodideSession | None:
         """The running session, if any (for its `boot_ms`, say)."""
         return self._session
+
+    def warm_up(self) -> None:
+        """Start the session in the background, so the first cell doesn't wait for it.
+
+        Returns at once. Call it when the capability is created, or when a
+        conversation opens: the boot (10 to 15 s for the default packages) then runs
+        while the model writes its first cell, and a cell that arrives sooner waits
+        for the rest of it. A start that fails is tried again by the first cell,
+        which raises the error. Does nothing while a session is running.
+        """
+
+        def start() -> None:
+            with self._lock:
+                try:
+                    self._get_session()
+                except RuntimeError:
+                    pass
+
+        threading.Thread(target=start, name="pyodide-repl-warm-up", daemon=True).start()
 
     def reset(self) -> None:
         """Drop the session and the cell history; the next cell starts fresh."""
@@ -366,6 +391,7 @@ class PyodideRepl(AbstractCapability[Any]):
                 download=self.download,
                 max_output_bytes=self.max_output_bytes,
                 store=self._host,
+                warm_imports=self.warm_imports,
             )
             # Failures here are host setup problems (no Deno, a failed download, a
             # package that won't load, a closed store), not something for the model

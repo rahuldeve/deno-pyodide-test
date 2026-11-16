@@ -280,6 +280,28 @@ def test_packages_are_imported_by_their_modules_names() -> None:
         session.close()
 
 
+WARMED = """\
+import sys
+print([m in sys.modules for m in ("scipy.stats", "statsmodels.api")], "importlib" in globals())
+"""
+
+
+def test_slow_submodules_are_imported_at_boot(numpy_session: PyodideSession) -> None:
+    # by _deno/warmup.py, whose own names (importlib) stay out of __main__
+    result = numpy_session.run(WARMED)
+    assert (result.error, result.stdout) == (None, "[True, True] False\n")
+
+
+def test_no_warm_imports() -> None:
+    session = PyodideSession(warm_imports=False)
+    session.start()
+    try:
+        result = session.run(WARMED)
+        assert (result.error, result.stdout) == (None, "[False, False] False\n")
+    finally:
+        session.close()
+
+
 def test_cell_ids_must_increase(bare: PyodideSession) -> None:
     bare.run("1", cell_id=5)
     with pytest.raises(ValueError, match="cell_id"):

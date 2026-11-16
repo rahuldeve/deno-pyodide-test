@@ -58,6 +58,7 @@ QUESTIONS = [
 
 def main() -> None:
     repl = PyodideRepl(variables={"df": make_weather()}, on_change="append")
+    repl.warm_up()  # boot while the model writes its first cell
     agent = Agent(
         MODEL,
         instructions="Answer questions about the data by running code in the REPL.",

@@ -15,11 +15,13 @@
 //
 // Usage: deno run <flags> main.ts --dist DIR [--packages scikit-learn,pyarrow]
 //                                [--imports sklearn] [--max-output-bytes N] [--store DIR]
+//                                [--no-warmup]
 //
 // --packages are loaded; --imports are imported at boot, so the first cell doesn't
 // pay for them. The host passes the modules of the packages it was asked for (from
 // the lock file: a package's name isn't always its module's), not of those only
-// `host` needs (pyarrow), which are imported when needed.
+// `host` needs (pyarrow), which are imported when needed. warmup.py then imports
+// their slow submodules (`scipy.stats`, `statsmodels.api`), unless --no-warmup.
 //
 // With --store, cells read the host's variables in DIR as `host.NAME` (runner.setup_host).
 
@@ -148,6 +150,12 @@ for (const module of args.imports) {
     globals: pyodide.globals.get("dict")(),
   });
 }
+if (args.warmup) {
+  pyodide.runPython(
+    await Deno.readTextFile(new URL("./warmup.py", import.meta.url)),
+    { globals: pyodide.globals.get("dict")(), filename: "<warmup>" },
+  );
+}
 
 // Private API: Pyodide calls it with the cause of a fatal error, then throws
 // (pyodide.asm.mjs, API.fatal_error). Without it, the listeners below still exit.
@@ -230,6 +238,7 @@ function parseArgs(argv: string[]) {
     imports: [] as string[],
     maxOutputBytes: 1 << 20,
     store: "",
+    warmup: true,
   };
   for (let i = 0; i < argv.length; i++) {
     const value = argv[i + 1];
@@ -249,6 +258,9 @@ function parseArgs(argv: string[]) {
       case "--store":
         options.store = value;
         i++;
+        break;
+      case "--no-warmup":
+        options.warmup = false;
         break;
       case "--max-output-bytes":
         options.maxOutputBytes = Number(value);

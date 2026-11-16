@@ -86,7 +86,9 @@ class PyodideSession:
 
     Not thread-safe: run one cell at a time. After `SessionError` the session is
     dead and every later call raises it again. With `store`, cells read its values
-    as `host.NAME`; the session keeps the store open while it holds it.
+    as `host.NAME`; the session keeps the store open while it holds it. With
+    `warm_imports`, the boot also imports the packages' slow submodules
+    (`_deno/warmup.py`), so the first cell to use them doesn't.
     """
 
     def __init__(
@@ -98,8 +100,10 @@ class PyodideSession:
         max_output_bytes: int = 1 << 20,
         store: VariableStore | None = None,
         download: bool = True,
+        warm_imports: bool = True,
     ) -> None:
         self.packages = tuple(packages)
+        self.warm_imports = warm_imports
         self.deno = deno or default_deno()
         self.dist_dir = Path(dist_dir) if dist_dir else default_dist_dir()
         self.max_output_bytes = max_output_bytes
@@ -139,6 +143,7 @@ class PyodideSession:
             "--max-output-bytes",
             str(self.max_output_bytes),
             *store,
+            *([] if self.warm_imports else ["--no-warmup"]),
         ]
 
     def _load_only(self) -> list[str]:
