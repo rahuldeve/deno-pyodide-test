@@ -4,14 +4,21 @@ main.ts loads this into a namespace of its own and gives `__main__` one `Host`, 
 `read` goes through Deno (see `runner.setup_host`). It uses only the standard
 library, and pyarrow for Arrow values, which the session loads when the store has
 any (imported on the first read, unless `import pandas` already did). Every access
-reads `view.json` again, so a store closed on the host fails the read. Ported from
-eryx-test's `host_accessor.py`, without `host.tools` for now.
+reads `view.json` again, so it sees the host's latest changes, and a store closed on
+the host fails the read. Ported from eryx-test's `host_accessor.py`, without
+`host.tools` for now.
 """
 
 import json
 import pickle
+import time
 from collections.abc import Callable, Iterator
 from typing import Any
+
+# Reads of a value that the host keeps replacing between our two reads
+_ATTEMPTS = 5
+# How long to retry opening view.json while the host replaces it (Windows)
+_VIEW_RETRY_S = 1.0
 
 
 def _from_arrow(data: bytes, series: bool) -> Any:
@@ -29,8 +36,8 @@ def _from_arrow(data: bytes, series: bool) -> Any:
 class Host:
     """Read-only access to the host's variables: `host.df` or `host["df"]`.
 
-    Each read loads the value again, so it returns a fresh copy: changing it
-    changes neither the host's value nor the next read.
+    Each read loads the value again, so it returns a fresh copy of the host's
+    current value: changing it changes neither the host's value nor the next read.
     """
 
     __slots__ = ("_read", "_root")
@@ -40,7 +47,20 @@ class Host:
         object.__setattr__(self, "_read", read)
 
     def _entries(self) -> dict[str, dict[str, Any]]:
-        return json.loads(self._read(f"{self._root}/view.json"))
+        return json.loads(self._read_view())
+
+    def _read_view(self) -> bytes:
+        # Windows refuses to open a file for a moment while it is being replaced; a
+        # closed store is FileNotFoundError, and fails at once
+        deadline = time.monotonic() + _VIEW_RETRY_S
+        while True:
+            try:
+                return self._read(f"{self._root}/view.json")
+            except FileNotFoundError:
+                raise
+            except OSError:
+                if time.monotonic() > deadline:
+                    raise
 
     def _entry(self, name: str) -> dict[str, Any]:
         entries = self._entries()
@@ -49,8 +69,20 @@ class Host:
             raise KeyError(f"no host variable {name!r}; available: {available}")
         return entries[name]
 
-    def _load(self, name: str, entry: dict[str, Any]) -> Any:
-        data = self._read(f"{self._root}/blobs/{entry['blob']}")
+    def _fetch(self, name: str) -> tuple[dict[str, Any], bytes]:
+        """The variable's entry and bytes; `KeyError` only if there is no such variable."""
+        for _ in range(_ATTEMPTS):
+            entry = self._entry(name)
+            try:
+                return entry, self._read(f"{self._root}/blobs/{entry['blob']}")
+            except OSError:
+                # The host replaced or removed the value between the two reads, and
+                # deleted the old bytes: read the view again
+                if self._entries().get(name, {}).get("blob") == entry["blob"]:
+                    raise
+        raise OSError(f"host variable {name!r} kept changing while it was read")
+
+    def _decode(self, name: str, entry: dict[str, Any], data: bytes) -> Any:
         codec = entry["codec"]
         if codec == "pickle":
             return pickle.loads(data)
@@ -59,7 +91,7 @@ class Host:
         raise ValueError(f"host variable {name!r} has unknown codec {codec!r}")
 
     def __getitem__(self, name: str) -> Any:
-        return self._load(name, self._entry(name))
+        return self._decode(name, *self._fetch(name))
 
     def __getattr__(self, name: str) -> Any:
         if name.startswith("_"):
@@ -67,10 +99,10 @@ class Host:
         # Checked first, not by catching KeyError: unpickling can raise one too
         # (zoneinfo's ZoneInfoNotFoundError), which must reach the cell as it is
         try:
-            entry = self._entry(name)
+            entry, data = self._fetch(name)
         except KeyError as e:
             raise AttributeError(e.args[0]) from None
-        return self._load(name, entry)
+        return self._decode(name, entry, data)
 
     def info(self, name: str) -> dict[str, Any]:
         """The variable's entry: its type, size and how it is stored."""

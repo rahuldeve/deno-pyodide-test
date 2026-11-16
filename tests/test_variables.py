@@ -1,4 +1,4 @@
-"""The read-only variable store: on the host, and through a PyodideSession.
+"""The variable store: on the host, and through a PyodideSession.
 
 Ported from eryx-test's tests/test_variables.py.
 """
@@ -11,6 +11,7 @@ import importlib.util
 import inspect
 import json
 import pickle
+import threading
 import warnings
 from collections.abc import Iterator
 from pathlib import Path
@@ -53,6 +54,7 @@ def test_layout() -> None:
             "blob": hashlib.sha256(data).hexdigest(),
             "type": "int",
             "size": len(data),
+            "generation": 0,
         }
         assert (root / "blobs" / x["blob"]).read_bytes() == data
         assert sorted(p.name for p in root.iterdir()) == ["blobs", "view.json"]
@@ -309,6 +311,113 @@ def test_host_is_read_only() -> None:
             host["x"] = 2
 
 
+# Changes on the host
+
+
+def blob_names(store: VariableStore) -> set[str]:
+    return {p.name for p in (store.directory / "blobs").iterdir()}
+
+
+def test_set_update_and_remove() -> None:
+    with VariableStore({"x": 1, "y": [1]}) as store:
+        host = host_for(store)
+        store.set("x", "one")
+        assert store.generation == 1
+        assert host.x == "one"
+        assert store.info("x").type == "str"
+        assert store.info("x").generation == 1
+        assert store.info("y").generation == 0
+
+        store.update({"z": 3}, y=[2], w=4)
+        assert store.generation == 2
+        # a replaced value keeps its place; new ones go last
+        assert store.names() == list(host) == ["x", "y", "z", "w"]
+        assert (host.y, host.z, host.w) == ([2], 3, 4)
+
+        store.remove("x", "z")
+        assert store.names() == list(host) == ["y", "w"]
+        with pytest.raises(AttributeError, match="no host variable 'x'"):
+            _ = host.x
+        # only the named values' bytes are left, and no temporary files
+        assert blob_names(store) == {store.info(n).blob for n in ("y", "w")}
+        assert sorted(p.name for p in store.directory.iterdir()) == [
+            "blobs",
+            "view.json",
+        ]
+
+
+def test_a_failed_change_changes_nothing() -> None:
+    with VariableStore({"x": 1}) as store:
+        before = (store.directory / "view.json").read_bytes()
+        with pytest.raises((pickle.PicklingError, AttributeError)):
+            store.update(y=2, f=lambda: 0)
+        with pytest.raises(ValueError, match="Python identifiers"):
+            store.set("not-a-name", 1)
+        with pytest.raises(KeyError, match="no host variable 'y'"):
+            store.remove("x", "y")
+        assert store.names() == ["x"]
+        assert store.generation == 0
+        assert (store.directory / "view.json").read_bytes() == before
+
+
+def test_changes_after_close() -> None:
+    store = VariableStore({"x": 1})
+    store.close()
+    for change in (lambda: store.set("x", 2), lambda: store.remove("x")):
+        with pytest.raises(ValueError, match="closed"):
+            change()
+    assert not store.directory.exists()
+
+
+def test_sandbox_packages_follow_the_values() -> None:
+    with VariableStore({"x": 1}) as store:
+        assert store.sandbox_packages == ()
+        store.set("df", weather())
+        assert store.sandbox_packages == ("pyarrow",)
+        store.remove("df")
+        assert store.sandbox_packages == ()
+
+
+def test_value_changed_between_the_hosts_two_reads() -> None:
+    # `host` reads view.json, then the blob it names; the host may replace the
+    # value in between and delete the old blob
+    # (values of their own: a blob another variable names isn't deleted)
+    with VariableStore({"x": 1, "y": "y"}) as store:
+        changes = iter([lambda: store.set("x", 2), lambda: store.remove("y")])
+
+        def read(path: str) -> bytes:
+            if "/blobs/" in path and (change := next(changes, None)):
+                change()
+            return Path(path).read_bytes()
+
+        host = Host(str(store.directory), read)
+        assert host.x == 2
+        with pytest.raises(AttributeError, match="no host variable 'y'"):
+            _ = host.y
+
+
+def test_reads_while_the_host_writes() -> None:
+    with VariableStore({"n": 0, "data": list(range(1000))}) as store:
+        host = host_for(store)
+        done = threading.Event()
+
+        def write() -> None:
+            for i in range(1, 300):
+                store.update(n=i, data=list(range(i, i + 1000)))
+            done.set()
+
+        writer = threading.Thread(target=write)
+        writer.start()
+        seen = []
+        while not done.is_set():
+            data = host.data
+            assert data == list(range(data[0], data[0] + 1000))
+            seen.append(host.n)
+        writer.join()
+        assert seen == sorted(seen)
+        assert host.n == 299
+
+
 # In the sandbox
 
 
@@ -479,10 +588,67 @@ def test_store_closed_while_the_session_runs() -> None:
     try:
         store.close()
         result = session.run("host.x")
-        assert result.error == "OSError"
+        assert result.error == "FileNotFoundError"
         assert "can't read the host's variable store" in result.stderr
     finally:
         session.close()
+
+
+def test_changes_reach_a_running_session() -> None:
+    with VariableStore({"x": 1}) as store:
+        session = PyodideSession((), store=store)
+        session.start()
+        try:
+            assert session.run("x = host.x; x").stdout == "1\n"
+            store.update(x=2, y="new")
+            # a copy keeps the old value; a read gets the new one
+            assert session.run("x, host.x, host.y").stdout == "(1, 2, 'new')\n"
+            store.remove("y")
+            result = session.run("host.y")
+            assert result.error == "AttributeError"
+            assert "no host variable 'y'; available: x" in result.stderr
+        finally:
+            session.close()
+
+
+def test_session_reads_while_the_host_writes() -> None:
+    # Deno's reads racing the host's renames and deletes, which differ on Windows
+    with VariableStore({"n": 0, "data": list(range(1000))}) as store:
+        session = PyodideSession((), store=store)
+        session.start()
+        done = threading.Event()
+
+        def write() -> None:
+            i = 0
+            while not done.is_set():
+                i += 1
+                # back and forth, so a deleted blob is soon wanted again
+                store.update(n=i, data=list(range(i % 3, i % 3 + 1000)))
+
+        writer = threading.Thread(target=write)
+        writer.start()
+        try:
+            result = session.run(
+                "import time\n"
+                "seen, end = [], time.monotonic() + 2\n"
+                "while time.monotonic() < end:\n"
+                "    data = host.data\n"
+                "    assert data == list(range(data[0], data[0] + 1000)), data[:3]\n"
+                "    seen.append(host.n)\n"
+                "len(seen) > 10, seen == sorted(seen)"
+            )
+        finally:
+            done.set()
+            writer.join()
+        try:
+            assert result.error is None, result.stderr
+            assert result.stdout == "(True, True)\n"
+            # every named blob is there, the others are gone
+            named = {store.info(n).blob for n in store.names()}
+            assert blob_names(store) == named
+            assert session.run("host.n").stdout == f"{host_for(store).n}\n"
+        finally:
+            session.close()
 
 
 def test_no_store_means_no_host() -> None:

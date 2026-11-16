@@ -9,8 +9,10 @@ session given the store lets Deno read that directory (and only read it), and de
         session.start()
         session.run("len(host.df)")
 
-Every read decodes the file again, so it returns a fresh copy. The store can't be
-changed after it is created.
+Every read decodes the file again, so it returns a fresh copy, and sees the store
+as it is at that moment: the host can add, replace and remove values while sessions
+run (`set`, `update`, `remove`), and the next read in a cell sees the change. A
+copy a cell already made keeps the old value. Cells can't change the store.
 
 A pandas DataFrame or Series goes as an Arrow IPC stream when pyarrow is installed
 on the host (codec `arrow` or `arrow-series`). Arrow's format doesn't depend on the
@@ -38,10 +40,15 @@ instead (`Deno.readFileSync`), because Pyodide's NODEFS mount passes a cell's
 permission) breaks Pyodide for good. A refused read through Deno is an ordinary
 exception in the cell.
 
-Layout of the store's directory, written in full before any session can read it:
+Layout of the store's directory:
 
     view.json      {name: entry}, the fields of `Entry`
     blobs/<hash>   one value's bytes, named by their sha256
+
+A change writes the new blobs first, then replaces `view.json` in one rename, so a
+reader sees the whole old view or the whole new one, never a mix. Blobs no view
+names any more are then deleted; a reader that read the old view just before then
+finds its blob gone, reads the view again and gets the new value (`host.py`).
 """
 
 import hashlib
@@ -54,10 +61,12 @@ import pickle
 import shutil
 import sys
 import tempfile
+import threading
+import time
 import types
 import warnings
 import weakref
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from types import TracebackType
 from typing import Any, Self
@@ -69,6 +78,10 @@ from pyodide_sandbox.distribution import SANDBOX_VERSIONS
 class VersionMismatchWarning(UserWarning):
     """A value was pickled by another numpy, pandas, scipy or statsmodels than the
     sandbox has."""
+
+
+# A value's bytes, codec and type name on the host
+_Encoded = tuple[bytes, str, str]
 
 
 @dataclass(frozen=True)
@@ -84,57 +97,99 @@ class Entry:
     type: str
     """The value's type name on the host, e.g. `DataFrame`."""
     size: int
+    generation: int
+    """The store's `generation` when the value was set: 0 for the values it was
+    created with."""
 
 
 class VariableStore:
     """Host values for the sandbox to read as `host.NAME` (see module docs).
 
     `variables` is copied and each value pickled when the store is created, so an
-    unpicklable value fails here and later changes to the dict aren't seen. The
-    directory is removed by `close()`, at the end of a `with` block, or when the
-    store is garbage collected.
+    unpicklable value fails here and later changes to the dict aren't seen; the
+    same goes for `set` and `update`. Changes are seen at once by every session
+    reading the store. Thread-safe. The directory is removed by `close()`, at the
+    end of a `with` block, or when the store is garbage collected.
     """
 
     def __init__(self, variables: Mapping[str, Any] | None = None) -> None:
-        values = dict(variables or {})
-        bad = [n for n in values if not _is_name(n)]
-        if bad:
-            raise ValueError(f"variable names must be Python identifiers: {bad}")
-        encoded = {}
-        for name, value in values.items():
-            arrow = _to_arrow(value)
-            if arrow is None:
-                data, modules = _pickle(value)
-                _check_versions(name, modules)
-                arrow = (data, "pickle")
-            encoded[name] = arrow
+        encoded = _encode_all(dict(variables or {}))
+        self._lock = threading.Lock()
+        self._generation = 0
+        self._entries: dict[str, Entry] = {}
         # resolved, as Deno's --allow-read compares real paths
         self._dir = pathlib.Path(tempfile.mkdtemp(prefix="pyodide-store-")).resolve()
         self._finalizer = weakref.finalize(
             self, shutil.rmtree, self._dir, ignore_errors=True
         )
         try:
-            self._entries = self._write(
-                {
-                    name: (data, codec, type(values[name]).__name__)
-                    for name, (data, codec) in encoded.items()
-                }
-            )
+            (self._dir / "blobs").mkdir()
+            self._apply(encoded, ())
         except BaseException:
             self._finalizer()
             raise
 
-    def _write(self, encoded: dict[str, tuple[bytes, str, str]]) -> dict[str, Entry]:
+    def set(self, name: str, value: Any) -> None:
+        """Add `name`, or replace its value; cells see it on their next read."""
+        self.update({name: value})
+
+    def update(self, variables: Mapping[str, Any] | None = None, /, **kw: Any) -> None:
+        """Add or replace several values at once: a cell sees all of them or none.
+
+        New names go after the existing ones; a replaced value keeps its place. If
+        any value can't be encoded, the store is left as it was.
+        """
+        values = {**(variables or {}), **kw}
+        if values:
+            self._change(_encode_all(values), ())
+
+    def remove(self, *names: str) -> None:
+        """Remove variables; a missing name raises `KeyError` and removes none."""
+        if names:
+            self._change({}, names)
+
+    def _change(self, encoded: dict[str, _Encoded], removed: Sequence[str]) -> None:
+        with self._lock:
+            if not self._finalizer.alive:
+                raise ValueError("the variable store is closed")
+            if missing := [n for n in removed if n not in self._entries]:
+                raise KeyError(f"no host variable {missing[0]!r}")
+            self._generation += 1
+            self._apply(encoded, removed)
+
+    def _apply(self, encoded: dict[str, _Encoded], removed: Sequence[str]) -> None:
+        """Write the new blobs, then the new view, then delete unnamed blobs."""
         blobs = self._dir / "blobs"
-        blobs.mkdir()
-        entries = {}
+        entries = dict(self._entries)
+        for name in removed:
+            del entries[name]
         for name, (data, codec, type_name) in encoded.items():
             digest = hashlib.sha256(data).hexdigest()
-            (blobs / digest).write_bytes(data)
-            entries[name] = Entry(name, codec, digest, type_name, len(data))
+            # Even if it exists: on Windows, a blob deleted while a session reads it
+            # stays listed until the read ends, then goes. Readers of the one in
+            # place see the old file or this one, with the same bytes.
+            _replace_atomically(blobs / digest, data)
+            entries[name] = Entry(
+                name, codec, digest, type_name, len(data), self._generation
+            )
         view = {name: asdict(entry) for name, entry in entries.items()}
-        (self._dir / "view.json").write_text(json.dumps(view, indent=1))
-        return entries
+        _replace_atomically(
+            self._dir / "view.json", json.dumps(view, indent=1).encode()
+        )
+        self._entries = entries
+        named = {e.blob for e in entries.values()}
+        for blob in blobs.iterdir():
+            if blob.name not in named and not blob.name.startswith("."):
+                try:
+                    blob.unlink()
+                # Windows, while a session reads it: the next change deletes it
+                except OSError:
+                    pass
+
+    @property
+    def generation(self) -> int:
+        """How many changes the store has had since it was created."""
+        return self._generation
 
     @property
     def directory(self) -> pathlib.Path:
@@ -143,13 +198,17 @@ class VariableStore:
 
     @property
     def sandbox_packages(self) -> tuple[str, ...]:
-        """Pyodide packages the sandbox needs to decode the values: pyarrow for Arrow."""
+        """Pyodide packages the sandbox needs to decode the values: pyarrow for Arrow.
+
+        It can grow when a value is added; a running session then loads the new
+        package before its next cell (`PyodideSession.run`).
+        """
         if any(e.codec.startswith("arrow") for e in self._entries.values()):
             return ("pyarrow",)
         return ()
 
     def names(self) -> list[str]:
-        """The variables' names, in the order they were given."""
+        """The variables' names, in the order they were added."""
         return list(self._entries)
 
     def info(self, name: str) -> Entry:
@@ -173,6 +232,37 @@ class VariableStore:
     def __repr__(self) -> str:
         listed = ", ".join(f"{e.name}: {e.type}" for e in self._entries.values())
         return f"VariableStore({listed})"
+
+
+def _encode_all(values: dict[str, Any]) -> dict[str, _Encoded]:
+    """Each value as Arrow if it can go that way, else pickled (see module docs)."""
+    if bad := [n for n in values if not _is_name(n)]:
+        raise ValueError(f"variable names must be Python identifiers: {bad}")
+    encoded = {}
+    for name, value in values.items():
+        arrow = _to_arrow(value)
+        if arrow is None:
+            data, modules = _pickle(value)
+            _check_versions(name, modules)
+            arrow = (data, "pickle")
+        encoded[name] = (*arrow, type(value).__name__)
+    return encoded
+
+
+def _replace_atomically(path: pathlib.Path, data: bytes) -> None:
+    """Write `data` to `path` so that a reader sees the old file or the new one."""
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}")
+    temporary.write_bytes(data)
+    # Windows refuses to replace a file a reader has open for a moment
+    for attempt in range(50):
+        try:
+            os.replace(temporary, path)
+            return
+        except PermissionError:
+            if attempt == 49:
+                temporary.unlink(missing_ok=True)
+                raise
+            time.sleep(0.01)
 
 
 _ARROW_METADATA = b"pyodide_sandbox"

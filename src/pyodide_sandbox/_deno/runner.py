@@ -55,7 +55,9 @@ def _read_through_deno(path: str) -> bytes:
     try:
         return js.Deno.readFileSync(path).to_bytes()
     except JsException as e:
-        raise OSError(f"can't read the host's variable store: {e}") from None
+        # NotFound: the store was closed, or a value's old bytes deleted (host.py)
+        kind = FileNotFoundError if e.name == "NotFound" else OSError
+        raise kind(f"can't read the host's variable store: {e}") from None
 
 
 async def run_cell(code: str, number: int) -> str | None:
