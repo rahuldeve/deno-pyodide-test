@@ -9,6 +9,7 @@ import copy
 import dataclasses
 import gc
 import json
+import re
 import warnings
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -30,7 +31,13 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai_harness.compaction import ClearToolResults
 
 from pyodide_sandbox.distribution import LOCK_FILE
-from pyodide_sandbox.repl import NUMERICS, SCIPY_LINALG, STATSMODELS, PyodideRepl
+from pyodide_sandbox.repl import (
+    NUMERICS,
+    SCIPY_LINALG,
+    STATSMODELS,
+    Plot,
+    PyodideRepl,
+)
 from pyodide_sandbox.variables import VariableStore
 
 Call = tuple[str, dict[str, object]]
@@ -164,6 +171,7 @@ def test_instructions_describe_the_sandbox() -> None:
     assert no_scipy.endswith(NUMERICS.format(scipy_linalg=""))
     assert "scipy" not in no_scipy
     assert "statsmodels" not in no_scipy
+    assert "bokeh" not in no_scipy
 
 
 def test_instructions_follow_what_is_loaded(tmp_path: Path) -> None:
@@ -569,3 +577,100 @@ def test_rebinds_after_agent_is_gone(repl: PyodideRepl) -> None:
     gc.collect()
     make_agent(repl, Script(run_cells("1 + 1"))).run_sync("go")
     assert repl.cells[0].stdout == "2\n"
+
+
+SHOW = """\
+from bokeh.plotting import figure, show
+p = figure(title={title!r})
+p.line([1, 2, 3], [3, 1, 2])
+show(p)
+"""
+
+
+def test_plots_reach_the_host_and_the_model_is_told(
+    make_repl: Callable[..., PyodideRepl],
+) -> None:
+    seen: list[tuple[Plot, int]] = []
+    repl = make_repl(("bokeh",), on_plot=lambda p: seen.append((p, len(repl.cells))))
+    script = Script(
+        run_cells(
+            SHOW.format(title="one") + "show(p)",
+            "print('no plot')",
+            SHOW.format(title="two"),
+        )
+    )
+    result = make_agent(repl, script).run_sync("go")
+
+    assert tool_returns(result.all_messages()) == [
+        "[cell 1]\n[plot 1 shown to the user]\n[plot 2 shown to the user]\n",
+        "[cell 2]\nno plot\n",
+        "[cell 3]\n[plot 3 shown to the user]\n",
+    ]
+    assert [(p.number, p.cell) for p in repl.plots] == [(1, 1), (2, 1), (3, 3)]
+    assert repl.cells[0].plots == repl.plots[:2]
+    # called once the cell is recorded, in order
+    assert [(p.number, n) for p, n in seen] == [(1, 1), (2, 1), (3, 3)]
+    assert seen[0][0] is repl.plots[0]
+    titles = [
+        m["attributes"]["text"]
+        for p in repl.plots
+        for m in _models(p.json["doc"])
+        if m.get("name") == "Title"
+    ]
+    assert titles == ["one", "one", "two"]
+    assert {p.json["version"] for p in repl.plots} == {"3.9.0"}
+    # history shows them too, and reset() starts counting again
+    assert "[plot 3 shown to the user]" in repl.cells[2].output()
+    repl.reset()
+    assert repl.plots == []
+
+
+def _models(value: Any) -> Iterator[dict[str, Any]]:
+    """Every serialized bokeh model in a json_item's `doc`."""
+    if isinstance(value, dict):
+        if value.get("type") == "object":
+            yield value
+        for item in value.values():
+            yield from _models(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _models(item)
+
+
+def test_plot_too_big_for_the_cell(make_repl: Callable[..., PyodideRepl]) -> None:
+    repl = make_repl(("bokeh",), max_plot_bytes=6000)
+    assert "at most 0.006 MB of JSON" in repl._instructions_text()
+    script = Script(run_cells(SHOW.format(title="x" * 6000), SHOW.format(title="ok")))
+    returns = tool_returns(make_agent(repl, script).run_sync("go").all_messages())
+    assert re.search(
+        r"ValueError: this plot is 0\.0[0-9]+ MB of JSON, and a cell's plots can be "
+        r"at most 0\.006 MB in all",
+        returns[0],
+    )
+    assert returns[0].endswith("plot less data (aggregate, bin or sample it first)\n")
+    assert returns[1] == "[cell 2]\n[plot 1 shown to the user]\n"
+
+
+def test_on_plot_errors_end_the_run(make_repl: Callable[..., PyodideRepl]) -> None:
+    def fail(plot: Plot) -> None:
+        raise RuntimeError("the UI is gone")
+
+    repl = make_repl(("bokeh",), on_plot=fail)
+    with pytest.raises(RuntimeError, match="the UI is gone"):
+        make_agent(repl, Script(run_cells(SHOW.format(title="x")))).run_sync("go")
+    assert [p.number for p in repl.plots] == [1]
+
+
+def test_plot_html() -> None:
+    plot = Plot(1, 1, {"version": "3.9.0", "doc": {"t": "</script><!-- & é"}})
+    page = plot.html(title="<b>&")
+    assert "<title>&lt;b&gt;&amp;</title>" in page
+    assert page.count("</script>") == 7  # 5 bundles, the item and the embed
+    assert "<!--" not in page
+    start = page.index('id="plot-json">') + len('id="plot-json">')
+    item = page[start : page.index("</script>", start)]
+    assert json.loads(item) == plot.json
+    assert "https://cdn.bokeh.org/bokeh/release/bokeh-widgets-3.9.0.min.js" in page
+    for version in [None, '3.9.0.dev1"><script>', 3]:
+        with pytest.raises(ValueError, match="not a bokeh version"):
+            Plot(1, 1, {"version": version}).html()

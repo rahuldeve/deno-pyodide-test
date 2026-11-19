@@ -6,7 +6,7 @@ from pyodide_sandbox.distribution import (
     DistributionError,
     ensure_distribution,
 )
-from pyodide_sandbox.repl import Cell, PyodideRepl
+from pyodide_sandbox.repl import Cell, Plot, PyodideRepl
 from pyodide_sandbox.session import (
     CellResult,
     PyodideSession,
@@ -22,6 +22,7 @@ __all__ = [
     "Cell",
     "CellResult",
     "DistributionError",
+    "Plot",
     "PyodideRepl",
     "PyodideSession",
     "SessionCrashed",

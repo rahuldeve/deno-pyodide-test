@@ -8,6 +8,10 @@
   and echoes the value of a bare last expression, as a REPL would.
 - `repl_history` returns the code of earlier cells, and their output on request.
 
+With bokeh among the packages, a cell's `show(p)` sends the plot to the host
+as a `Plot` (bokeh's `json_item`), on `Cell.plots` and to `on_plot`, for the host
+to render with BokehJS; the model is told `[plot N shown to the user]`.
+
 With `variables=` (or a shared `store=`), code in a cell reads host values as
 `host.NAME` (see `pyodide_sandbox.variables`). The host can change them while the
 REPL runs (`repl.store.set(...)`): the instructions list the current variables and
@@ -30,10 +34,13 @@ See `pyodide_sandbox.session` for the process boundary.
 """
 
 import asyncio
+import html
+import json
+import re
 import threading
 import time
 import weakref
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import KW_ONLY, InitVar, dataclass, field
 from pathlib import Path
 from typing import Any, Self
@@ -86,6 +93,16 @@ Python arithmetic and `math` still raise as usual. Check computed values with \
 SCIPY_LINALG = """ `scipy.linalg`'s `inv`, `solve` and `cholesky` do raise \
 `LinAlgError`, so use them when you need a matrix inverse or solve of your own."""
 
+BOKEH = """
+
+Plot with bokeh: `show(p)` (from `bokeh.plotting` or `bokeh.io`) sends a figure, \
+widget or layout (`column(p1, p2)`, `gridplot`) to the user as an interactive \
+plot, and `run_code` reports `[plot N shown to the user]`. You can't see plots, so \
+describe them from the values you computed. A cell's plots can hold at most \
+{max_plot_mb} MB of JSON: aggregate, bin or sample larger data first. \
+`output_notebook` and `output_file` aren't needed; `bokeh.sampledata`, \
+`export_png` and `export_svg` aren't available."""
+
 # What tests/test_session.py::test_statsmodels_facts records
 STATSMODELS = """
 
@@ -101,6 +118,69 @@ summary, check that `np.linalg.matrix_rank(result.model.exog)` equals \
 is true. The first `import statsmodels.api` takes several seconds."""
 
 
+# The BokehJS bundles a json_item may need: widgets and tables for their models,
+# gl for `output_backend="webgl"`, mathjax for LaTeX labels
+_BOKEH_BUNDLES = ("", "-gl", "-widgets", "-tables", "-mathjax")
+_BOKEH_VERSION = re.compile(r"\d+\.\d+\.\d+")
+_PAGE = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{title}</title>
+{scripts}
+</head>
+<body>
+<div id="plot"></div>
+<script type="application/json" id="plot-json">{item}</script>
+<script>
+Bokeh.embed.embed_item(
+  JSON.parse(document.getElementById("plot-json").textContent), "plot");
+</script>
+</body>
+</html>
+"""
+
+
+@dataclass
+class Plot:
+    """A bokeh object that a cell `show()`ed, for the host to render with BokehJS.
+
+    `json` is what `bokeh.embed.json_item` made in the sandbox: pass it to
+    `Bokeh.embed.embed_item(item, element_id)` in a page that loads BokehJS of the
+    same version (`json["version"]`), or use `html()`. It was written by code in
+    the sandbox, so treat it as untrusted: a plot can carry JavaScript
+    (`CustomJS`) and HTML (`Div`), which run when it is rendered. Render it where
+    that can't reach the app or its users' sessions, e.g. a sandboxed iframe on
+    another origin.
+    """
+
+    number: int
+    """Counts the REPL's plots from 1, in the order they were shown."""
+    cell: int
+    """The cell that showed it."""
+    json: dict[str, Any] = field(repr=False)
+
+    def html(self, title: str = "Bokeh plot") -> str:
+        """A standalone page showing the plot, loading BokehJS from Bokeh's CDN.
+
+        The page runs whatever the plot carries (see the class docs), so open it
+        accordingly. Raises `ValueError` if `json` names no plain bokeh version.
+        """
+        version = self.json.get("version")
+        if not (isinstance(version, str) and _BOKEH_VERSION.fullmatch(version)):
+            raise ValueError(f"not a bokeh version: {version!r}")
+        scripts = "\n".join(
+            '<script src="https://cdn.bokeh.org/bokeh/release/'
+            f'bokeh{bundle}-{version}.min.js" crossorigin="anonymous"></script>'
+            for bundle in _BOKEH_BUNDLES
+        )
+        # `<` only occurs inside JSON strings, where \u003c means the same, so no
+        # `</script>` or `<!--` in the plot can end the script element early
+        item = json.dumps(self.json).replace("<", "\\u003c")
+        return _PAGE.format(title=html.escape(title), scripts=scripts, item=item)
+
+
 @dataclass
 class Cell:
     """One `run_code` call: the code as the model wrote it and what it printed."""
@@ -114,11 +194,14 @@ class Cell:
     duration_ms: float
     store_generation: int = 0
     """The store's `generation` when the cell started."""
+    plots: list[Plot] = field(default_factory=list)
+    """The plots the cell showed, in order."""
 
     def output(self) -> str:
         parts = [self.stdout, self.stderr]
         if self.error and self.error not in self.stderr:
             parts.append(self.error + "\n")
+        parts += [f"[plot {p.number} shown to the user]\n" for p in self.plots]
         return "".join(parts)
 
     def summary(self, width: int = 80) -> str:
@@ -183,6 +266,15 @@ class PyodideRepl(AbstractCapability[Any]):
     max_output_bytes: int = 1 << 20
     """Each of a cell's stdout and stderr is cut to this inside the sandbox, so a
     cell can't flood the host; history keeps what is left."""
+
+    max_plot_bytes: int = 10_000_000
+    """The most JSON a cell's bokeh plots can add up to; a `show()` past it raises
+    `ValueError` in the cell, and the instructions tell the model the limit."""
+
+    on_plot: Callable[[Plot], None] | None = None
+    """Called with each plot a cell shows, once the cell has finished and is in
+    `cells`, in order. It runs in the worker thread that ran the cell, and an
+    exception from it ends the agent run. The plots are also kept on `Cell.plots`."""
 
     index_cells: int = 50
     """Most recent cells listed in the instructions; `0` lists none, only how many
@@ -266,6 +358,11 @@ class PyodideRepl(AbstractCapability[Any]):
     @property
     def cells(self) -> list[Cell]:
         return list(self._cells)
+
+    @property
+    def plots(self) -> list[Plot]:
+        """Every cell's plots, in the order they were shown."""
+        return [plot for cell in self._cells for plot in cell.plots]
 
     @property
     def session(self) -> PyodideSession | None:
@@ -375,6 +472,8 @@ class PyodideRepl(AbstractCapability[Any]):
         )
         if "statsmodels" in loaded:
             text += STATSMODELS
+        if "bokeh" in loaded:
+            text += BOKEH.format(max_plot_mb=f"{self.max_plot_bytes / 1e6:.3g}")
         if names := self._host.names():
             entries = [self._host.info(n) for n in names]
             changed = {e.name: self._changed_since(e.generation) for e in entries}
@@ -418,6 +517,7 @@ class PyodideRepl(AbstractCapability[Any]):
                 dist_dir=self.dist_dir,
                 download=self.download,
                 max_output_bytes=self.max_output_bytes,
+                max_plot_bytes=self.max_plot_bytes,
                 store=self._host,
                 warm_imports=self.warm_imports,
             )
@@ -457,12 +557,14 @@ class PyodideRepl(AbstractCapability[Any]):
                 else self.execution_timeout_ms / 1000
             )
             stdout = stderr = ""
+            items: list[dict[str, Any]] = []
             # before the cell, so a change during it counts as after it started
             generation = self._host.generation
             start = time.perf_counter()
             try:
                 result = session.run(code, timeout=timeout, cell_id=number)
                 stdout, stderr, error = result.stdout, result.stderr, result.error
+                items = result.plots
             except DistributionError as e:
                 # pyarrow for a DataFrame added since the start; as for the start,
                 # a host problem, not the model's
@@ -484,7 +586,15 @@ class PyodideRepl(AbstractCapability[Any]):
                 duration_ms=(time.perf_counter() - start) * 1000,
                 store_generation=generation,
             )
+            shown = sum(len(c.plots) for c in self._cells)
+            cell.plots = [
+                Plot(number=shown + i, cell=number, json=item)
+                for i, item in enumerate(items, 1)
+            ]
             self._cells.append(cell)
+            if self.on_plot is not None:
+                for plot in cell.plots:
+                    self.on_plot(plot)
             return cell
 
 
