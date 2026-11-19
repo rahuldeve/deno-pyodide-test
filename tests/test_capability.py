@@ -610,40 +610,32 @@ def test_plots_reach_the_host_and_the_model_is_told(
     )
     result = make_agent(repl, script).run_sync("go")
 
+    ids = [p.id for p in repl.plots]
+    assert all(re.fullmatch("[0-9a-f]{8}", i) for i in ids) and len(set(ids)) == 3
     assert tool_returns(result.all_messages()) == [
-        "[cell 1]\n[plot 1 shown to the user]\n[plot 2 shown to the user]\n",
+        f"[cell 1]\n[plot {ids[0]}]\n[plot {ids[1]}]\n",
         "[cell 2]\nno plot\n",
-        "[cell 3]\n[plot 3 shown to the user]\n",
+        f"[cell 3]\n[plot {ids[2]}]\n",
     ]
     assert [(p.number, p.cell) for p in repl.plots] == [(1, 1), (2, 1), (3, 3)]
     assert repl.cells[0].plots == repl.plots[:2]
     # called once the cell is recorded, in order
     assert [(p.number, n) for p, n in seen] == [(1, 1), (2, 1), (3, 3)]
     assert seen[0][0] is repl.plots[0]
-    titles = [
-        m["attributes"]["text"]
-        for p in repl.plots
-        for m in _models(p.json["doc"])
-        if m.get("name") == "Title"
-    ]
-    assert titles == ["one", "one", "two"]
+    assert [p.title for p in repl.plots] == ["one", "one", "two"]
     assert {p.json["version"] for p in repl.plots} == {"3.9.0"}
     # history shows them too, and reset() starts counting again
-    assert "[plot 3 shown to the user]" in repl.cells[2].output()
+    assert f"[plot {ids[2]}]" in repl.cells[2].output()
     repl.reset()
     assert repl.plots == []
 
 
-def _models(value: Any) -> Iterator[dict[str, Any]]:
-    """Every serialized bokeh model in a json_item's `doc`."""
-    if isinstance(value, dict):
-        if value.get("type") == "object":
-            yield value
-        for item in value.values():
-            yield from _models(item)
-    elif isinstance(value, list):
-        for item in value:
-            yield from _models(item)
+def test_plot_ids_survive_clipping(make_repl: Callable[..., PyodideRepl]) -> None:
+    repl = make_repl(("bokeh",), max_output_chars=100)
+    script = Script(run_cells("print('x' * 500)\n" + SHOW.format(title="t")))
+    (returned,) = tool_returns(make_agent(repl, script).run_sync("go").all_messages())
+    assert "401 more characters" in returned  # 500 x and a newline, less 100
+    assert returned.endswith(f"output=True)\n[plot {repl.plots[0].id}]\n")
 
 
 def test_plot_too_big_for_the_cell(make_repl: Callable[..., PyodideRepl]) -> None:
@@ -657,7 +649,7 @@ def test_plot_too_big_for_the_cell(make_repl: Callable[..., PyodideRepl]) -> Non
         returns[0],
     )
     assert returns[0].endswith("plot less data (aggregate, bin or sample it first)\n")
-    assert returns[1] == "[cell 2]\n[plot 1 shown to the user]\n"
+    assert returns[1] == f"[cell 2]\n[plot {repl.plots[0].id}]\n"
 
 
 def test_on_plot_errors_end_the_run(make_repl: Callable[..., PyodideRepl]) -> None:
@@ -668,18 +660,3 @@ def test_on_plot_errors_end_the_run(make_repl: Callable[..., PyodideRepl]) -> No
     with pytest.raises(RuntimeError, match="the UI is gone"):
         make_agent(repl, Script(run_cells(SHOW.format(title="x")))).run_sync("go")
     assert [p.number for p in repl.plots] == [1]
-
-
-def test_plot_html() -> None:
-    plot = Plot(1, 1, {"version": "3.9.0", "doc": {"t": "</script><!-- & é"}})
-    page = plot.html(title="<b>&")
-    assert "<title>&lt;b&gt;&amp;</title>" in page
-    assert page.count("</script>") == 7  # 5 bundles, the item and the embed
-    assert "<!--" not in page
-    start = page.index('id="plot-json">') + len('id="plot-json">')
-    item = page[start : page.index("</script>", start)]
-    assert json.loads(item) == plot.json
-    assert "https://cdn.bokeh.org/bokeh/release/bokeh-widgets-3.9.0.min.js" in page
-    for version in [None, '3.9.0.dev1"><script>', 3]:
-        with pytest.raises(ValueError, match="not a bokeh version"):
-            Plot(1, 1, {"version": version}).html()

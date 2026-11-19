@@ -10,7 +10,10 @@
 
 With bokeh loaded (a default package), a cell's `show(p)` sends the plot to the host
 as a `Plot` (bokeh's `json_item`), on `Cell.plots` and to `on_plot`, for the host
-to render with BokehJS; the model is told `[plot N shown to the user]`.
+to render with BokehJS. The model is told its id (`[plot 3f9a2c1b]`), and `run_code`
+returns the plots in its tool return's metadata, where they stay in the message
+history; `pyodide_sandbox.plots` has the rest, for letting the model choose which
+plots the user sees.
 
 With `variables=` (or a shared `store=`), code in a cell reads host values as
 `host.NAME` (see `pyodide_sandbox.variables`). The host can change them while the
@@ -34,9 +37,6 @@ See `pyodide_sandbox.session` for the process boundary.
 """
 
 import asyncio
-import html
-import json
-import re
 import threading
 import time
 import weakref
@@ -45,7 +45,7 @@ from dataclasses import KW_ONLY, InitVar, dataclass, field
 from pathlib import Path
 from typing import Any, Self
 
-from pydantic_ai import FunctionToolset, RunContext
+from pydantic_ai import FunctionToolset, RunContext, ToolReturn
 from pydantic_ai.agent import AbstractAgent
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import InstructionChangePolicy, InstructionPart
@@ -55,6 +55,7 @@ from pyodide_sandbox.distribution import (
     DistributionError,
     loaded_packages,
 )
+from pyodide_sandbox.plots import Plot, plots_metadata
 from pyodide_sandbox.session import (
     DEFAULT_PACKAGES,
     PyodideSession,
@@ -95,10 +96,11 @@ SCIPY_LINALG = """ `scipy.linalg`'s `inv`, `solve` and `cholesky` do raise \
 
 BOKEH = """
 
-Plot with bokeh: `show(p)` (from `bokeh.plotting` or `bokeh.io`) sends a figure, \
-widget or layout (`column(p1, p2)`, `gridplot`) to the user as an interactive \
-plot, and `run_code` reports `[plot N shown to the user]`. You can't see plots, so \
-describe them from the values you computed. A cell's plots can hold at most \
+Plot with bokeh: `show(p)` (from `bokeh.plotting` or `bokeh.io`) saves a figure, \
+widget or layout (`column(p1, p2)`, `gridplot`) as an interactive plot, and \
+`run_code` reports its id, as in `[plot 3f9a2c1b]`. You can't see plots, so describe \
+each one from the values you computed, and give its id when you report on it. A \
+cell's plots can hold at most \
 {max_plot_mb} MB of JSON: aggregate, bin or sample larger data first. \
 `output_notebook` and `output_file` aren't needed; `bokeh.sampledata`, \
 `export_png` and `export_svg` aren't available."""
@@ -118,69 +120,6 @@ summary, check that `np.linalg.matrix_rank(result.model.exog)` equals \
 is true. The first `import statsmodels.api` takes several seconds."""
 
 
-# The BokehJS bundles a json_item may need: widgets and tables for their models,
-# gl for `output_backend="webgl"`, mathjax for LaTeX labels
-_BOKEH_BUNDLES = ("", "-gl", "-widgets", "-tables", "-mathjax")
-_BOKEH_VERSION = re.compile(r"\d+\.\d+\.\d+")
-_PAGE = """\
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>{title}</title>
-{scripts}
-</head>
-<body>
-<div id="plot"></div>
-<script type="application/json" id="plot-json">{item}</script>
-<script>
-Bokeh.embed.embed_item(
-  JSON.parse(document.getElementById("plot-json").textContent), "plot");
-</script>
-</body>
-</html>
-"""
-
-
-@dataclass
-class Plot:
-    """A bokeh object that a cell `show()`ed, for the host to render with BokehJS.
-
-    `json` is what `bokeh.embed.json_item` made in the sandbox: pass it to
-    `Bokeh.embed.embed_item(item, element_id)` in a page that loads BokehJS of the
-    same version (`json["version"]`), or use `html()`. It was written by code in
-    the sandbox, so treat it as untrusted: a plot can carry JavaScript
-    (`CustomJS`) and HTML (`Div`), which run when it is rendered. Render it where
-    that can't reach the app or its users' sessions, e.g. a sandboxed iframe on
-    another origin.
-    """
-
-    number: int
-    """Counts the REPL's plots from 1, in the order they were shown."""
-    cell: int
-    """The cell that showed it."""
-    json: dict[str, Any] = field(repr=False)
-
-    def html(self, title: str = "Bokeh plot") -> str:
-        """A standalone page showing the plot, loading BokehJS from Bokeh's CDN.
-
-        The page runs whatever the plot carries (see the class docs), so open it
-        accordingly. Raises `ValueError` if `json` names no plain bokeh version.
-        """
-        version = self.json.get("version")
-        if not (isinstance(version, str) and _BOKEH_VERSION.fullmatch(version)):
-            raise ValueError(f"not a bokeh version: {version!r}")
-        scripts = "\n".join(
-            '<script src="https://cdn.bokeh.org/bokeh/release/'
-            f'bokeh{bundle}-{version}.min.js" crossorigin="anonymous"></script>'
-            for bundle in _BOKEH_BUNDLES
-        )
-        # `<` only occurs inside JSON strings, where \u003c means the same, so no
-        # `</script>` or `<!--` in the plot can end the script element early
-        item = json.dumps(self.json).replace("<", "\\u003c")
-        return _PAGE.format(title=html.escape(title), scripts=scripts, item=item)
-
-
 @dataclass
 class Cell:
     """One `run_code` call: the code as the model wrote it and what it printed."""
@@ -198,11 +137,18 @@ class Cell:
     """The plots the cell showed, in order."""
 
     def output(self) -> str:
+        """What the cell printed, then the ids of the plots it showed."""
+        return self.printed() + self.plot_lines()
+
+    def printed(self) -> str:
+        """stdout, stderr, and the error if stderr doesn't name it."""
         parts = [self.stdout, self.stderr]
         if self.error and self.error not in self.stderr:
             parts.append(self.error + "\n")
-        parts += [f"[plot {p.number} shown to the user]\n" for p in self.plots]
         return "".join(parts)
+
+    def plot_lines(self) -> str:
+        return "".join(f"[plot {p.id}]\n" for p in self.plots)
 
     def summary(self, width: int = 80) -> str:
         """The cell's index line: number, ok/error and its first line of code."""
@@ -410,7 +356,7 @@ class PyodideRepl(AbstractCapability[Any]):
     def get_instructions(self) -> Any:
         return self._instructions
 
-    async def run_code(self, ctx: RunContext[Any], code: str) -> str:
+    async def run_code(self, ctx: RunContext[Any], code: str) -> str | ToolReturn:
         """Run Python code in the persistent REPL and return what it printed.
 
         Args:
@@ -418,14 +364,20 @@ class PyodideRepl(AbstractCapability[Any]):
                 calls; a bare last expression is printed, as in a REPL.
         """
         cell = await asyncio.to_thread(self._execute, code)
-        output = cell.output() or "(no output)\n"
-        if len(output) > self.max_output_chars:
-            output = (
-                output[: self.max_output_chars]
-                + f"\n... {len(output) - self.max_output_chars} more characters, "
+        printed = cell.printed()
+        if len(printed) > self.max_output_chars:
+            printed = (
+                printed[: self.max_output_chars]
+                + f"\n... {len(printed) - self.max_output_chars} more characters, "
                 f"see repl_history(cell={cell.number}, output=True)\n"
             )
-        return f"[cell {cell.number}]\n{output}"
+        # after the clipping, so the model always learns the plots' ids
+        output = printed + cell.plot_lines() or "(no output)\n"
+        text = f"[cell {cell.number}]\n{output}"
+        if not cell.plots:
+            return text
+        # kept in the history with the result, but not sent to the model
+        return ToolReturn(return_value=text, metadata=plots_metadata(cell.plots))
 
     async def repl_history(
         self,
