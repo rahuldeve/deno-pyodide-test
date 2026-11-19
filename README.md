@@ -64,33 +64,48 @@ plots made by a subagent, and the app gets them with the final answer
 (`pyodide_sandbox.plots`):
 
 ```python
-from pyodide_sandbox import PlotAnswer, split_answer, subagent_return
+from pydantic_ai_harness import SubAgent, SubAgents
+from pyodide_sandbox import DelegatedPlots, PlotAnswer, split_answer
 
-analyst = Agent(model, instructions="... report each plot's id and what it shows.")
-main = Agent(model, deps_type=Conversation, capabilities=[PlotAnswer()])
-
-@main.tool
-async def ask_analyst(ctx: RunContext[Conversation], question: str) -> ToolReturn:
-    # one global analyst; the conversation's own REPL, attached for this run
-    result = await analyst.run(question, usage=ctx.usage, capabilities=[ctx.deps.repl])
-    return subagent_return(result)    # its output + "Plots made: 3f9a2c1b (...)"
+analyst = Agent(
+    model,
+    name="analyst",
+    deps_type=Conversation,
+    instructions="... report each plot's id and what it shows.",
+    capabilities=[lambda ctx: ctx.deps.repl],  # the conversation's own REPL
+)
+main = Agent(
+    model,
+    deps_type=Conversation,
+    capabilities=[
+        SubAgents(agents=[SubAgent(analyst)]),  # delegate_task, deps passed on
+        DelegatedPlots(),
+        PlotAnswer(),
+    ],
+)
 
 result = await main.run(prompt, message_history=conv.history, deps=conv)
 for piece in split_answer(result.output, result.all_messages()):
     ...                               # str: markdown, Plot: render it
 ```
 
-- `subagent_return(result)` returns the subagent's output with the ids (and titles)
-  of the plots it made, and moves the plots into the caller's history.
+- `DelegatedPlots()` is for an agent that delegates with pydantic-ai-harness
+  `SubAgents`, whose `delegate_task` returns only the subagent's text. It collects
+  the plots REPLs make while the tool runs (in subagents of subagents too), lists
+  their ids (and titles) after that text (`Plots made: 3f9a2c1b (...)`), and moves
+  the plots into the caller's history. Pass `tool_names` if `SubAgents` was given
+  another `tool_name`.
+- A tool you write yourself, which runs a subagent with `await sub.run(...)`, returns
+  `subagent_return(result)` to the same effect.
 - `PlotAnswer()` tells the agent to place a plot by writing `{{plot:ID}}` on a line
   of its own in its final answer, and sends an id that no tool reported back to it
   for a retry. Plots it doesn't place aren't shown.
 - `split_answer` cuts the final text into markdown and `Plot`s, in order.
 
 `scripts/gradio_app.py` (`uv run poe app`) is a working example: a Gradio chat over a
-main agent and an analyst subagent, with one REPL per browser session and each plot
-in a sandboxed iframe (`<iframe sandbox="allow-scripts" srcdoc=...plot.html()...>`)
-inline in the answer.
+main agent and an analyst subagent (`SubAgents`), with one REPL per browser session
+and each plot in a sandboxed iframe
+(`<iframe sandbox="allow-scripts" srcdoc=...plot.html()...>`) inline in the answer.
 
 The page renders `plot.json` with `Bokeh.embed.embed_item(item, element_id)`,
 loading BokehJS of the same version (`plot.json["version"]`, 3.9.0) from
@@ -159,7 +174,7 @@ That is all the install there is, on Linux, macOS or Windows:
 ```sh
 uv sync
 uv run poe fetch     # optional; the first session downloads the same files
-uv run poe test      # 152 tests, ~6.5 min; the sandbox ones skip without Deno
+uv run poe test      # 153 tests, ~6.5 min; the sandbox ones skip without Deno
 uv run poe agent     # live demo on OpenRouter, needs OPENROUTER_API_KEY (AGENT_MODEL picks the model)
 uv run poe app       # the Gradio demo with a subagent and plots, on http://localhost:7860
 ```
