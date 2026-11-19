@@ -4,13 +4,17 @@ import importlib
 import sys
 import textwrap
 import types
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
+from pydantic_ai import Agent
+from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
+from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from pyodide_sandbox import modules as modules_module
-from pyodide_sandbox.modules import SandboxModules
+from pyodide_sandbox.modules import SandboxModules, instructions
+from pyodide_sandbox.repl import PyodideRepl
 from pyodide_sandbox.session import PyodideSession, SessionError
 from pyodide_sandbox.variables import VariableStore
 
@@ -203,6 +207,28 @@ def test_a_module_passed_twice_counts_once(load: Importer) -> None:
     assert SandboxModules.collect([module, module]).exports == {"sbx_twice": ("f",)}
 
 
+def test_repl_instructions(load: Importer) -> None:
+    module = load({"sbx_plain2.py": PLAIN}, "sbx_plain2")
+    repl = PyodideRepl((), sandbox_modules=[module])
+    text = repl._instructions_text()
+    assert text.endswith(
+        "\n\nsbx_plain2:\n"
+        "- scale(xs, factor=2.0): Multiply each value by factor.\n"
+        "- class Box(size: int)"
+    )
+    assert "Host modules: the host preloaded `sbx_plain2`." in text
+    assert "Host modules" not in PyodideRepl(())._instructions_text()
+    assert instructions(SandboxModules()) == ""
+
+    with pytest.raises(AttributeError, match="can't be changed"):
+        repl.sandbox_modules = []
+
+
+def test_repl_refuses_a_module_it_cant_ship() -> None:
+    with pytest.raises(ValueError, match="no source file"):
+        PyodideRepl((), sandbox_modules=[sys])
+
+
 # -- in a session --------------------------------------------------------------
 
 LIB = {
@@ -317,3 +343,46 @@ def test_a_module_that_fails_to_import_fails_the_start() -> None:
     message = str(raised.value)
     assert message.startswith("importing host module sbx_needs failed:\n")
     assert "ModuleNotFoundError: No module named 'sbx_not_a_package'" in message
+
+
+# -- through the capability ----------------------------------------------------
+
+
+def scripted(*codes: str) -> Callable[[list[ModelMessage], AgentInfo], ModelResponse]:
+    calls = [ToolCallPart("run_code", {"code": code}) for code in codes]
+
+    def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        if calls:
+            return ModelResponse(parts=[calls.pop(0)])
+        return ModelResponse(parts=[TextPart("done")])
+
+    return model
+
+
+def test_modules_survive_a_restart(load: Importer) -> None:
+    module = load({"sbx_restart.py": "def f():\n    return 'ok'\n"}, "sbx_restart")
+    repl = PyodideRepl((), sandbox_modules=[module], execution_timeout_ms=1000)
+    try:
+        agent = Agent(FunctionModel(scripted("while True: pass", "f()")))
+        agent.run_sync("go", capabilities=[repl])
+    finally:
+        repl.close()
+
+    timed_out, after = repl.cells
+    assert timed_out.error is not None
+    assert timed_out.error.endswith(
+        "variables from earlier cells are gone; host modules are still there"
+    )
+    assert after.stdout == "'ok'\n"
+
+
+def test_a_failed_import_ends_the_run(load: Importer) -> None:
+    # importing it on the host would raise too, so the module is made by hand
+    write(load.root, {"sbx_broken.py": "raise RuntimeError('nope')\n"})
+    module = types.ModuleType("sbx_broken")
+    module.__file__ = str(load.root / "sbx_broken.py")
+    repl = PyodideRepl((), sandbox_modules=[module])
+    agent = Agent(FunctionModel(scripted("1")))
+    with pytest.raises(RuntimeError, match="starting the PyodideRepl session failed"):
+        agent.run_sync("go", capabilities=[repl])
+    repl.close()

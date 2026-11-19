@@ -20,6 +20,11 @@ With `variables=` (or a shared `store=`), code in a cell reads host values as
 REPL runs (`repl.store.set(...)`): the instructions list the current variables and
 mark those changed after a cell the model ran, so it knows to read them again.
 
+With `sandbox_modules=[my_lib]`, every session preloads host modules: `my_lib`'s
+public functions and classes are defined in the cells, the instructions list their
+signatures and docstring summaries, and they run inside the sandbox, so arguments
+never leave it (see `pyodide_sandbox.modules`).
+
 Every cell is kept on the host, and the instructions carry an index of them built
 from that record rather than from the conversation. So whatever a compaction
 strategy does to old tool calls and results (clears, summarises or drops them),
@@ -32,13 +37,15 @@ Compaction capabilities can be listed in any order relative to `PyodideRepl`.
         capabilities=[ClearToolResults(max_tokens=50_000), repl],
     )
 
-Ported from eryx-test's `EryxRepl`, without its `host.tools` and snapshots so far.
+Ported from eryx-test's `EryxRepl`, without its `host.tools` (callbacks to the host)
+and snapshots so far.
 See `pyodide_sandbox.session` for the process boundary.
 """
 
 import asyncio
 import threading
 import time
+import types
 import weakref
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import KW_ONLY, InitVar, dataclass, field
@@ -55,6 +62,8 @@ from pyodide_sandbox.distribution import (
     DistributionError,
     loaded_packages,
 )
+from pyodide_sandbox.modules import SandboxModules
+from pyodide_sandbox.modules import instructions as modules_instructions
 from pyodide_sandbox.plots import Plot, plots_metadata, report_plots
 from pyodide_sandbox.session import (
     DEFAULT_PACKAGES,
@@ -200,6 +209,15 @@ class PyodideRepl(AbstractCapability[Any]):
     only on the host. Only an init argument: read `store` afterwards, as this
     attribute stays `None`."""
 
+    sandbox_modules: Sequence[types.ModuleType] = ()
+    """Host modules every session preloads (see `pyodide_sandbox.modules`): plain
+    Python, importing only the standard library and `packages`. Their public names
+    are defined in the cells and listed in the instructions. Their source is read
+    when the capability is created, so a module that can't be shipped raises
+    `ValueError` here; one that fails to import in the sandbox fails the session's
+    start. The whole module is visible to the model, so keep secrets out of it.
+    Can't be changed afterwards."""
+
     execution_timeout_ms: int | None = 60_000
     """Time limit for one cell; at the limit the process is killed. `None` removes it."""
 
@@ -268,6 +286,10 @@ class PyodideRepl(AbstractCapability[Any]):
         # put the instructions and `host` out of step
         if name == "store" and self.__dict__.get("store") is not None:
             raise AttributeError("PyodideRepl.store can't be changed after creation")
+        if name == "sandbox_modules" and "_modules" in self.__dict__:
+            raise AttributeError(
+                "PyodideRepl.sandbox_modules can't be changed after creation"
+            )
         if name == "variables":
             raise AttributeError("PyodideRepl.variables is only an init argument")
         super().__setattr__(name, value)
@@ -284,6 +306,7 @@ class PyodideRepl(AbstractCapability[Any]):
             # Pickled now so an unpicklable value fails here, not on the first call
             self.store = VariableStore(variables)
         self.packages = tuple(self.packages)
+        self._modules = SandboxModules.collect(self.sandbox_modules)
         # Each call runs alone, in the order the model made them: the session can
         # only run one cell at a time, and later cells may use earlier ones' variables
         self._toolset = FunctionToolset[Any](
@@ -427,6 +450,7 @@ class PyodideRepl(AbstractCapability[Any]):
             text += STATSMODELS
         if "bokeh" in loaded:
             text += BOKEH.format(max_plot_mb=f"{self.max_plot_bytes / 1e6:.3g}")
+        text += modules_instructions(self._modules)
         if names := self._host.names():
             entries = [self._host.info(n) for n in names]
             changed = {e.name: self._changed_since(e.generation) for e in entries}
@@ -473,6 +497,7 @@ class PyodideRepl(AbstractCapability[Any]):
                 max_plot_bytes=self.max_plot_bytes,
                 store=self._host,
                 warm_imports=self.warm_imports,
+                modules=self._modules,
             )
             # Failures here are host setup problems (no Deno, a failed download, a
             # package that won't load, a closed store), not something for the model
@@ -496,8 +521,16 @@ class PyodideRepl(AbstractCapability[Any]):
         """Drop a session that was killed or crashed."""
         self._close_session()
         note = "; the sandbox was restarted and variables from earlier cells are gone"
-        if self._host.names():
-            note += "; host variables are still there"
+        kept = [
+            what
+            for what, present in (
+                ("host modules", bool(self._modules)),
+                ("host variables", bool(self._host.names())),
+            )
+            if present
+        ]
+        if kept:
+            note += f"; {' and '.join(kept)} are still there"
         return note
 
     def _execute(self, code: str) -> Cell:
