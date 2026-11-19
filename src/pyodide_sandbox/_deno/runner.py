@@ -15,12 +15,18 @@ cell, which also catches what C extensions write. The cell's variables live in
 
 With a variable store, `setup_host` also defines `host` there (see `host.py`). With
 bokeh loaded, `setup_plots` makes its `show()` collect plots for the host instead of
-opening a browser (see `plots.py`); main.ts sends them with the cell's result.
+opening a browser (see `plots.py`); main.ts sends them with the cell's result. With
+host modules, `install_modules` writes them to Pyodide's in-memory file system,
+imports them and defines their public names in `__main__` (see
+`pyodide_sandbox.modules`).
 """
 
 import ast
+import importlib
 import importlib.util
+import json
 import linecache
+import os
 import sys
 import traceback
 
@@ -31,6 +37,9 @@ from pyodide.ffi import JsException
 import __main__
 
 _CELL_PREFIX = "<cell-"
+# Host modules live here, in Pyodide's in-memory file system: writes there never
+# reach Deno (see pyodide_sandbox.variables for what a write that did would do)
+MODULES_DIR = "/host_modules"
 
 # The running cell's bokeh plots (plots.Plots), with bokeh loaded
 _plots = None
@@ -63,6 +72,43 @@ def setup_plots(source: str, max_bytes: int) -> None:
         return
     _plots = _load_module(source, "<plots>")["Plots"](max_bytes)
     _plots.install()
+
+
+def install_modules(files_json: str, exports_json: str) -> str | None:
+    """Install the host's modules and define their public names in `__main__`.
+
+    `files_json` maps paths under `MODULES_DIR` to source, `exports_json` module
+    names to their public names. Returns None, or why it failed (a traceback for an
+    import that raised). Their files are real files, so tracebacks show their lines.
+    """
+    files = json.loads(files_json)
+    exports = json.loads(exports_json)
+    # appended to sys.path, so a host module can't replace a package or the
+    # standard library; one with the same name would silently never load, so
+    # refuse it instead
+    for top in sorted({path.split("/")[0].removesuffix(".py") for path in files}):
+        spec = importlib.util.find_spec(top)
+        if spec is not None:
+            where = spec.origin or "the sandbox"
+            return (
+                f"host module {top!r} has the name of a module the sandbox "
+                f"already has ({where}); rename it"
+            )
+    for path, source in files.items():
+        full = os.path.join(MODULES_DIR, path)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w", encoding="utf-8") as f:
+            f.write(source)
+    sys.path.append(MODULES_DIR)
+    importlib.invalidate_caches()
+    for name, names in exports.items():
+        try:
+            module = importlib.import_module(name)
+            for public in names:
+                setattr(__main__, public, getattr(module, public))
+        except BaseException:  # noqa: BLE001
+            return f"importing host module {name} failed:\n{traceback.format_exc()}"
+    return None
 
 
 def take_plots() -> str:

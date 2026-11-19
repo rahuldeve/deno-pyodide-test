@@ -2,11 +2,15 @@
 //
 //   host -> deno (stdin):   {"id": 1, "op": "run", "code": "..."}
 //                           {"op": "load", "packages": ["pyarrow"]} between cells
+//                           {"op": "modules", "files": {...}, "exports": {...}}
+//                           once, right after "ready", with host modules
 //   deno -> host (stdout):  {"op": "ready", "boot_ms": ...} once, then per cell
 //                           {"id": 1, "error": null | "ZeroDivisionError",
 //                            "stdout": "...", "stderr": "...", "plots": [...],
 //                            "duration_ms": ...}
-//                           per load {"op": "loaded"}, or, when Pyodide can't go on,
+//                           per load {"op": "loaded"}, per modules
+//                           {"op": "modules_loaded", "error": null | "..."}, or,
+//                           when Pyodide can't go on,
 //                           {"op": "fatal", "message": "..."} just before the process
 //                           exits (code 70)
 //
@@ -30,6 +34,9 @@
 // A "load" adds a package the store came to need after boot (pyarrow, when the host
 // adds a DataFrame); a failure goes to stderr, and the cell reading the value then
 // gets an ImportError.
+//
+// "modules" installs the host's modules and defines their public names in __main__
+// (runner.install_modules); the host fails the boot on an error.
 //
 // With bokeh loaded, a cell's `show(obj)` adds `obj` to the cell's "plots", as
 // bokeh's json_item (plots.py), up to --max-plot-bytes of JSON per cell.
@@ -159,6 +166,7 @@ runnerNamespace.get("setup_plots")(
   args.maxPlotBytes,
 );
 const takePlots = runnerNamespace.get("take_plots");
+const installModules = runnerNamespace.get("install_modules");
 for (const module of args.imports) {
   // not in __main__: a cell that uses `numpy` without importing it should fail
   pyodide.runPython(`import ${module}`, {
@@ -209,7 +217,23 @@ await send({ op: "ready", boot_ms: performance.now() - t0 });
 
 for await (const line of readLines(Deno.stdin.readable)) {
   if (!line.trim()) continue;
-  const request = JSON.parse(line); // from the host: "run" or "load"
+  const request = JSON.parse(line); // from the host: "run", "load" or "modules"
+  if (request.op === "modules") {
+    let error: string | null = null;
+    try {
+      error = installModules(
+        JSON.stringify(request.files),
+        JSON.stringify(request.exports),
+      ) ?? null;
+    } catch (e) {
+      die(e); // install_modules catches the modules' own exceptions
+    }
+    // what importing them printed isn't any cell's
+    stdout.take();
+    stderr.take();
+    await send({ op: "modules_loaded", error });
+    continue;
+  }
   if (request.op === "load") {
     try {
       await loadPackages(request.packages);

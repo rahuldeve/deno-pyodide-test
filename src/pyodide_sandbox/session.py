@@ -36,6 +36,7 @@ from pyodide_sandbox.distribution import (
     extra_dependencies,
     import_names,
 )
+from pyodide_sandbox.modules import SandboxModules
 from pyodide_sandbox.variables import VariableStore
 
 # main.ts and the Python it runs inside Pyodide, shipped in the package
@@ -48,6 +49,7 @@ DEFAULT_PACKAGES = ("numpy", "pandas", "scipy", "statsmodels", "bokeh", "tzdata"
 _MAX_LINE_BYTES = 8 << 20
 _STDERR_TAIL_LINES = 50
 _MAX_FATAL_CHARS = 1000
+_MAX_MODULES_ERROR_CHARS = 8000
 
 
 def default_deno() -> str:
@@ -96,7 +98,9 @@ class PyodideSession:
     `warm_imports`, the boot also imports the packages' slow submodules
     (`_deno/warmup.py`), so the first cell to use them doesn't. With bokeh among the
     packages, a cell's `show(obj)` adds `obj` to its result's `plots`, up to
-    `max_plot_bytes` of JSON per cell (more raises `ValueError` in the cell).
+    `max_plot_bytes` of JSON per cell (more raises `ValueError` in the cell). With
+    `modules`, every cell sees the host's modules' public names, and can import them
+    (see `pyodide_sandbox.modules`); a module that fails to import fails `start`.
     """
 
     def __init__(
@@ -110,8 +114,10 @@ class PyodideSession:
         store: VariableStore | None = None,
         download: bool = True,
         warm_imports: bool = True,
+        modules: SandboxModules | None = None,
     ) -> None:
         self.packages = tuple(packages)
+        self.modules = modules or SandboxModules()
         self.warm_imports = warm_imports
         self.deno = deno or default_deno()
         self.dist_dir = Path(dist_dir) if dist_dir else default_dist_dir()
@@ -222,7 +228,32 @@ class PyodideSession:
             daemon=True,
         ).start()
         self._wait(lambda m: m.get("op") == "ready", timeout, "boot")
+        if self.modules:
+            remaining = (
+                None
+                if timeout is None
+                else max(0.0, timeout - (time.perf_counter() - start))
+            )
+            self._install_modules(remaining)
         self.boot_ms = (time.perf_counter() - start) * 1000
+
+    def _install_modules(self, timeout: float | None) -> None:
+        self._send(
+            {
+                "op": "modules",
+                "files": self.modules.files,
+                "exports": self.modules.exports,
+            }
+        )
+        reply = self._wait(
+            lambda m: m.get("op") == "modules_loaded", timeout, "loading host modules"
+        )
+        error = reply.get("error")
+        if error is None:
+            return
+        if not isinstance(error, str):
+            raise self._die(SessionCrashed, "malformed reply from the sandbox")
+        raise self._die(SessionError, error[:_MAX_MODULES_ERROR_CHARS])
 
     def run(
         self, code: str, timeout: float | None = None, cell_id: int | None = None

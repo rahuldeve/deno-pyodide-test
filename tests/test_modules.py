@@ -11,6 +11,8 @@ import pytest
 
 from pyodide_sandbox import modules as modules_module
 from pyodide_sandbox.modules import SandboxModules
+from pyodide_sandbox.session import PyodideSession, SessionError
+from pyodide_sandbox.variables import VariableStore
 
 Tree = dict[str, str]
 
@@ -199,3 +201,119 @@ def test_size_limit(load: Importer, monkeypatch: pytest.MonkeyPatch) -> None:
 def test_a_module_passed_twice_counts_once(load: Importer) -> None:
     module = load({"sbx_twice.py": "def f(): pass"}, "sbx_twice")
     assert SandboxModules.collect([module, module]).exports == {"sbx_twice": ("f",)}
+
+
+# -- in a session --------------------------------------------------------------
+
+LIB = {
+    "sbx_lib/__init__.py": """\
+        \"\"\"Helpers.\"\"\"
+        from .stats import zscore, boom
+        print("imported sbx_lib")
+
+
+        class Point:
+            def __init__(self, x, y):
+                self.x, self.y = x, y
+
+            def norm(self):
+                return (self.x**2 + self.y**2) ** 0.5
+        """,
+    "sbx_lib/stats.py": """\
+        import statistics
+
+
+        def zscore(xs):
+            m, s = statistics.fmean(xs), statistics.stdev(xs)
+            return [round((x - m) / s, 3) for x in xs]
+
+
+        def boom():
+            raise ValueError("from the module")
+        """,
+    "sbx_outer/__init__.py": "SECRET = 'not for the sandbox'\n",
+    "sbx_outer/inner.py": "def twice(x):\n    return 2 * x\n",
+}
+
+
+@pytest.fixture(scope="module")
+def session(tmp_path_factory: pytest.TempPathFactory) -> Iterator[PyodideSession]:
+    importer = Importer(tmp_path_factory.mktemp("modules"))
+    lib = importer(LIB, "sbx_lib")
+    inner = importlib.import_module("sbx_outer.inner")
+    store = VariableStore({"p": lib.Point(3, 4)})
+    session = PyodideSession(
+        (), modules=SandboxModules.collect([lib, inner]), store=store
+    )
+    session.start()
+    yield session
+    session.close()
+    store.close()
+    importer.close()
+
+
+def test_names_are_predefined(session: PyodideSession) -> None:
+    result = session.run("zscore([1, 2, 3]), twice(4), Point(6, 8).norm()")
+    assert (result.error, result.stdout) == (None, "([-1.0, 0.0, 1.0], 8, 10.0)\n")
+
+
+def test_importing_them_prints_nothing_into_a_cell(session: PyodideSession) -> None:
+    result = session.run("pass")
+    assert (result.stdout, result.stderr) == ("", "")
+
+
+def test_import_brings_back_an_overwritten_name(session: PyodideSession) -> None:
+    result = session.run(
+        "zscore = None\nfrom sbx_lib import zscore\nimport sbx_outer.inner\n"
+        "zscore([0, 2]), sbx_outer.inner.twice(1)"
+    )
+    assert (result.error, result.stdout) == (None, "([-0.707, 0.707], 2)\n")
+
+
+def test_parents_are_empty(session: PyodideSession) -> None:
+    result = session.run("import sbx_outer\nhasattr(sbx_outer, 'SECRET')")
+    assert result.stdout == "False\n"
+
+
+def test_traceback_shows_the_modules_lines(session: PyodideSession) -> None:
+    result = session.run("boom()")
+    assert result.error == "ValueError"
+    assert '  File "/host_modules/sbx_lib/stats.py", line 10, in boom\n' in (
+        result.stderr
+    )
+    assert '    raise ValueError("from the module")\n' in result.stderr
+
+
+def test_host_variable_of_a_shipped_class(session: PyodideSession) -> None:
+    result = session.run("p = host.p\ntype(p).__module__, p.norm()")
+    assert (result.error, result.stdout) == (None, "('sbx_lib', 5.0)\n")
+
+
+def test_a_module_that_shadows_the_sandboxs_fails_the_start() -> None:
+    session = PyodideSession(
+        (),
+        modules=SandboxModules(
+            files={"json.py": "def f(): pass\n"},
+            exports={"json": ("f",)},
+            descriptions={"json": ("f()",)},
+        ),
+    )
+    with pytest.raises(SessionError, match="'json' has the name of a module"):
+        session.start()
+    assert not session.alive
+
+
+def test_a_module_that_fails_to_import_fails_the_start() -> None:
+    session = PyodideSession(
+        (),
+        modules=SandboxModules(
+            files={"sbx_needs.py": "import sbx_not_a_package\n"},
+            exports={"sbx_needs": ()},
+            descriptions={"sbx_needs": ()},
+        ),
+    )
+    with pytest.raises(SessionError) as raised:
+        session.start()
+    message = str(raised.value)
+    assert message.startswith("importing host module sbx_needs failed:\n")
+    assert "ModuleNotFoundError: No module named 'sbx_not_a_package'" in message
