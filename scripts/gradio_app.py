@@ -1,15 +1,18 @@
 """A Gradio chat over pydantic-ai agents, with the plots the main agent picks inline.
 
-The main agent answers the user, but can't run code: it asks an analyst subagent,
-whose Pyodide REPL reads the weather frame from `run_agent_repl.py` as `host.df`.
-The analyst's bokeh plots reach the main agent through `subagent_return`, and the
-main agent places the ones worth showing in its answer as `{{plot:ID}}`
-(`PlotAnswer`). The app cuts the answer up with `split_answer` and renders each plot
-in a sandboxed iframe, since a plot is code written in the sandbox.
+The main agent answers the user, but can't run code: it delegates to an analyst
+subagent through pydantic-ai-harness `SubAgents` (its `delegate_task` tool). The
+analyst's Pyodide REPL reads the weather frame from `run_agent_repl.py` as `host.df`.
+The analyst's bokeh plots reach the main agent with the delegation's result
+(`DelegatedPlots`), and the main agent places the ones worth showing in its answer
+as `{{plot:ID}}` (`PlotAnswer`). The app cuts the answer up with `split_answer` and
+renders each plot in a sandboxed iframe, since a plot is code written in the sandbox.
 
 Both agents are global; each browser session has its own `Conversation`: the main
 agent's message history and the analyst's REPL, started when the page loads and
-closed when the session ends.
+closed when the session ends. The conversation is the main agent's deps, which
+`SubAgents` passes on to the analyst, whose capability function picks the REPL
+from them.
 
 Runs on OpenRouter like `run_agent_repl.py` (OPENROUTER_API_KEY, AGENT_MODEL), and
 serves on http://localhost:7860 (GRADIO_SERVER_PORT to change it).
@@ -19,11 +22,12 @@ import html
 from dataclasses import dataclass, field
 
 import gradio as gr
-from pydantic_ai import Agent, RunContext, ToolReturn
+from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import ModelMessage
+from pydantic_ai_harness import SubAgent, SubAgents
 from run_agent_repl import MODEL, make_weather  # also loads .env.secret
 
-from pyodide_sandbox import Plot, PlotAnswer, PyodideRepl, split_answer, subagent_return
+from pyodide_sandbox import DelegatedPlots, Plot, PlotAnswer, PyodideRepl, split_answer
 
 # bokeh's default figure height, for a plot that sets none; plus room for margins
 DEFAULT_HEIGHT = 600
@@ -43,14 +47,23 @@ class Conversation:
         return cls(repl)
 
 
+def conversation_repl(ctx: RunContext[Conversation]) -> PyodideRepl:
+    """The REPL of the conversation the analyst is working for, for this run."""
+    return ctx.deps.repl
+
+
 analyst = Agent(
     MODEL,
+    name="analyst",
+    description="Computes with the weather data in Python and makes bokeh plots",
+    deps_type=Conversation,
     instructions=(
         "You analyse data by running code in the Python REPL; `host.df` holds daily "
         "weather (date, city, temp, rain) for three cities. Make a bokeh plot when it "
         "helps. Report the numbers you found and, for each plot, its id and what it "
         "shows."
     ),
+    capabilities=[conversation_repl],
     model_settings={"cache": True},
 )
 
@@ -62,21 +75,13 @@ main = Agent(
         "You can't see the data: ask the analyst, who computes with it and can make "
         "plots. Keep answers short, and show a plot when it helps."
     ),
-    capabilities=[PlotAnswer()],
+    capabilities=[
+        SubAgents(agents=[SubAgent(analyst)]),
+        DelegatedPlots(),  # the plots the analyst makes come back with its answer
+        PlotAnswer(),
+    ],
     model_settings={"cache": True},
 )
-
-
-@main.tool
-async def ask_analyst(ctx: RunContext[Conversation], question: str) -> ToolReturn:
-    """Ask the analyst to compute or plot something from the weather data.
-
-    Args:
-        question: What to find out or plot, with any detail the analyst needs.
-    """
-    # the session's REPL, attached to the global analyst for this run only
-    result = await analyst.run(question, usage=ctx.usage, capabilities=[ctx.deps.repl])
-    return subagent_return(result)
 
 
 def frame_height(plot: Plot) -> int:
