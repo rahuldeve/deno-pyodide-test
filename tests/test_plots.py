@@ -22,10 +22,12 @@ from pydantic_ai.messages import (
     ToolReturnPart,
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai_harness import SubAgent, SubAgents
 from pydantic_ai_harness.compaction import ClearToolResults
 
 from pyodide_sandbox import (
     PLOTS_KEY,
+    DelegatedPlots,
     Plot,
     PlotAnswer,
     PyodideRepl,
@@ -198,6 +200,51 @@ def test_main_agent_places_a_subagents_plot(
     ]
     # the instructions tell the main agent how to place plots
     assert "{{plot:3f9a2c1b}}" in str(result.all_messages()[0])
+
+
+def test_plots_come_back_through_harness_subagents(
+    make_repl: Callable[..., PyodideRepl],
+) -> None:
+    repl = make_repl()
+    analyst = Agent(
+        scripted(
+            call("run_code", code=SHOW.format(title="Rain by city")),
+            ModelResponse(parts=[TextPart("Oslo is wettest.")]),
+        ),
+        name="analyst",
+        deps_type=PyodideRepl,
+        # the REPL comes with the deps SubAgents passes on
+        capabilities=[lambda ctx: ctx.deps],
+    )
+
+    def answer(messages: list[ModelMessage]) -> ModelResponse:
+        (reported,) = [p for p in returns(messages) if p.tool_name == "delegate_task"]
+        plot_id = re.search(r"Plots made: ([0-9a-f]{8})", str(reported.content))
+        assert plot_id is not None
+        return ModelResponse(parts=[TextPart(f"Oslo.\n{{{{plot:{plot_id[1]}}}}}")])
+
+    main = Agent(
+        scripted(
+            call("delegate_task", agent_name="analyst", task="rain?"),
+            answer,
+        ),
+        deps_type=PyodideRepl,
+        capabilities=[
+            SubAgents(agents=[SubAgent(analyst)]),
+            DelegatedPlots(),
+            PlotAnswer(),
+        ],
+    )
+    result = main.run_sync("Which city is wettest?", deps=repl)
+
+    (plot,) = repl.plots
+    (reported,) = returns(result.all_messages())
+    assert (
+        reported.content
+        == f'Oslo is wettest.\n\nPlots made: {plot.id} ("Rain by city")'
+    )
+    assert reported.metadata == {PLOTS_KEY: [plot.to_dict()]}
+    assert split_answer(result.output, result.all_messages()) == ["Oslo.", plot]
 
 
 def test_subagent_without_plots() -> None:

@@ -8,21 +8,25 @@ round trip of the history.
 
 The model picks which plots the user sees:
 
-- A subagent with a REPL reports the ids it made; the tool that delegated to it
-  returns `subagent_return(result)`, which lists them for the calling agent and moves
-  the plots into its history.
+- A subagent with a REPL reports the ids it made, and the plots move into the
+  calling agent's history with the delegating tool's return, which lists them. With
+  pydantic-ai-harness `SubAgents`, give the calling agent `DelegatedPlots()`; a tool
+  you write yourself returns `subagent_return(result)`.
 - The agent that answers the user gets `PlotAnswer()`. It places a plot by writing
   `{{plot:ID}}` on a line of its own in its final answer; an id it never saw is sent
   back for a retry.
 - The app cuts the final answer into text and plots with `split_answer`, and renders
   each plot itself, e.g. in a sandboxed iframe from `Plot.html()`.
 
-        @main.tool
-        async def ask_analyst(ctx: RunContext[Deps], question: str) -> ToolReturn:
-            result = await analyst.run(
-                question, usage=ctx.usage, capabilities=[ctx.deps.analyst_repl]
-            )
-            return subagent_return(result)
+        analyst = Agent(..., name="analyst", capabilities=[lambda ctx: ctx.deps.repl])
+        main = Agent(
+            ...,
+            capabilities=[
+                SubAgents(agents=[SubAgent(analyst)]),
+                DelegatedPlots(),
+                PlotAnswer(),
+            ],
+        )
 
         result = await main.run(prompt, message_history=history, deps=deps)
         for piece in split_answer(result.output, result.all_messages()):
@@ -34,14 +38,26 @@ import json
 import re
 import secrets
 from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic_ai import ModelRetry, RunContext, ToolReturn
 from pydantic_ai.agent import AgentRunResult
-from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai.messages import ModelMessage, ModelRequest, ToolReturnPart
+from pydantic_ai.capabilities import (
+    AbstractCapability,
+    ValidatedToolArgs,
+    WrapToolExecuteHandler,
+)
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ToolCallPart,
+    ToolReturnPart,
+)
 from pydantic_ai.output import OutputContext
+from pydantic_ai.tools import ToolDefinition
 
 PLOTS_KEY = "pyodide_sandbox.plots"
 """The key in a tool return's `metadata` that holds its plots, as `Plot.to_dict()`s."""
@@ -55,6 +71,10 @@ ids a tool reported, and say in words what each plot shows."""
 
 # An id the model wrote, however malformed, so that it can be checked
 _MARKER = re.compile(r"\{\{\s*plot\s*:\s*([^{}\s]*)\s*\}\}")
+# The plot lists of the delegations running in this context, innermost last
+_collectors: ContextVar[tuple[list["Plot"], ...]] = ContextVar(
+    "pyodide_sandbox_plot_collectors", default=()
+)
 _BOKEH_VERSION = re.compile(r"\d+\.\d+\.\d+")
 # The BokehJS bundles a json_item may need: widgets and tables for their models,
 # gl for `output_backend="webgl"`, mathjax for LaTeX labels
@@ -194,6 +214,23 @@ def plots_in(messages: Sequence[ModelMessage]) -> dict[str, Plot]:
     return found
 
 
+def report_plots(plots: Sequence[Plot]) -> None:
+    """Add `plots` to every delegation running in this context (`collect_plots`)."""
+    for collected in _collectors.get():
+        collected.extend(plots)
+
+
+@contextmanager
+def collect_plots() -> Iterator[list[Plot]]:
+    """A list that collects the plots REPLs make in this context, nested runs too."""
+    collected: list[Plot] = []
+    token = _collectors.set((*_collectors.get(), collected))
+    try:
+        yield collected
+    finally:
+        _collectors.reset(token)
+
+
 def subagent_return(result: AgentRunResult[Any]) -> ToolReturn:
     """What a tool that ran a subagent returns, so the plots it made aren't lost.
 
@@ -201,14 +238,49 @@ def subagent_return(result: AgentRunResult[Any]) -> ToolReturn:
     the plots made during that run, for the calling agent to choose from. The plots
     themselves go in the metadata, so they are in the caller's history too.
     """
-    plots = list(plots_in(result.new_messages()).values())
     text = result.output if isinstance(result.output, str) else str(result.output)
+    return _plots_return(text, list(plots_in(result.new_messages()).values()))
+
+
+def _plots_return(text: str, plots: Sequence[Plot]) -> ToolReturn:
+    """`text` listing `plots`, which ride along in the metadata."""
     if plots:
         listed = ", ".join(
             p.id + (f" ({json.dumps(p.title)})" if p.title else "") for p in plots
         )
         text += f"\n\nPlots made: {listed}"
     return ToolReturn(return_value=text, metadata=plots_metadata(plots))
+
+
+@dataclass
+class DelegatedPlots(AbstractCapability[Any]):
+    """For an agent that delegates with pydantic-ai-harness `SubAgents`.
+
+    The delegate tool returns only the subagent's output as text, so the plots its
+    REPL makes would stay in the subagent's run. This collects the plots made while
+    the tool runs (by subagents of subagents too) and returns them as
+    `subagent_return` does: listed after the output, and in the metadata.
+    """
+
+    tool_names: Sequence[str] = ("delegate_task",)
+    """The delegate tools; `SubAgents(tool_name=...)` names its own."""
+
+    async def wrap_tool_execute(
+        self,
+        ctx: RunContext[Any],
+        *,
+        call: ToolCallPart,
+        tool_def: ToolDefinition,
+        args: ValidatedToolArgs,
+        handler: WrapToolExecuteHandler,
+    ) -> Any:
+        if call.tool_name not in self.tool_names:
+            return await handler(args)
+        with collect_plots() as plots:
+            result = await handler(args)
+        if not plots or not isinstance(result, str):
+            return result
+        return _plots_return(result, plots)
 
 
 @dataclass

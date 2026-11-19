@@ -55,7 +55,7 @@ from pyodide_sandbox.distribution import (
     DistributionError,
     loaded_packages,
 )
-from pyodide_sandbox.plots import Plot, plots_metadata
+from pyodide_sandbox.plots import Plot, plots_metadata, report_plots
 from pyodide_sandbox.session import (
     DEFAULT_PACKAGES,
     PyodideSession,
@@ -376,6 +376,7 @@ class PyodideRepl(AbstractCapability[Any]):
         text = f"[cell {cell.number}]\n{output}"
         if not cell.plots:
             return text
+        report_plots(cell.plots)  # to the delegations running this cell, if any
         # kept in the history with the result, but not sent to the model
         return ToolReturn(return_value=text, metadata=plots_metadata(cell.plots))
 

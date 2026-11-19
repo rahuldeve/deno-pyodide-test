@@ -8,6 +8,7 @@ from pyodide_sandbox.distribution import (
 )
 from pyodide_sandbox.plots import (
     PLOTS_KEY,
+    DelegatedPlots,
     Plot,
     PlotAnswer,
     plots_in,
@@ -30,6 +31,7 @@ __all__ = [
     "SANDBOX_VERSIONS",
     "Cell",
     "CellResult",
+    "DelegatedPlots",
     "DistributionError",
     "Plot",
     "PlotAnswer",
