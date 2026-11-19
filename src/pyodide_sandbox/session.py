@@ -33,6 +33,7 @@ from typing import IO, Any
 from pyodide_sandbox.distribution import (
     default_dist_dir,
     ensure_distribution,
+    extra_dependencies,
     import_names,
 )
 from pyodide_sandbox.variables import VariableStore
@@ -140,7 +141,13 @@ class PyodideSession:
             # names checked against the lock file by ensure_distribution, which also
             # supplies the modules (dotted identifiers)
             "--packages",
-            ",".join([*self.packages, *self._load_only()]),
+            ",".join(
+                [
+                    *self.packages,
+                    *extra_dependencies(self.packages, root),
+                    *self._load_only(),
+                ]
+            ),
             "--imports",
             ",".join(import_names(self.packages, root)),
             "--max-output-bytes",

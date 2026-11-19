@@ -54,6 +54,9 @@ SANDBOX_VERSIONS = {
     "scipy": "1.18.0",
     "statsmodels": "0.14.6",
 }
+# Dependencies the lock file leaves out: bokeh 3.9 imports narwhals to make a
+# ColumnDataSource from a DataFrame. Downloaded and loaded with the package.
+EXTRA_DEPENDENCIES = {"bokeh": ("narwhals",)}
 
 _TIMEOUT = 60.0
 _WORKERS = 4
@@ -171,6 +174,21 @@ def import_names(
     return names
 
 
+def extra_dependencies(
+    packages: Iterable[str], dist_dir: str | Path | None = None
+) -> list[str]:
+    """What `packages` need beyond the lock file's dependencies (`EXTRA_DEPENDENCIES`).
+
+    Pyodide's `loadPackage` follows only the lock file, so a session loads these
+    too. A package not in the lock file raises `ValueError`.
+    """
+    packages = list(packages)
+    root = Path(dist_dir) if dist_dir is not None else default_dist_dir()
+    found = _with_dependencies(_read_lock(root), packages)
+    extras = {e for name in found for e in EXTRA_DEPENDENCIES.get(name, ())}
+    return sorted(extras - {_canonical(name) for name in packages})
+
+
 def loaded_packages(
     packages: Iterable[str], dist_dir: str | Path | None = None
 ) -> set[str]:
@@ -233,6 +251,8 @@ def _with_dependencies(lock: dict[str, Any], packages: list[str]) -> list[str]:
             return
         found.append(key)
         for dependency in lock[key].get("depends", []):
+            visit(dependency)
+        for dependency in EXTRA_DEPENDENCIES.get(key, ()):
             visit(dependency)
 
     for name in packages:

@@ -22,6 +22,7 @@ from pyodide_sandbox.distribution import (
     _locked,
     default_dist_dir,
     ensure_distribution,
+    extra_dependencies,
     import_names,
 )
 from pyodide_sandbox.session import DEFAULT_PACKAGES
@@ -105,6 +106,15 @@ def test_missing_files_without_download(tmp_path: Path, mirror: str) -> None:
     ensure_distribution([], tmp_path, index_url=mirror)
     with pytest.raises(DistributionError, match=f"missing from .*: {NUMPY};"):
         ensure_distribution(["numpy"], tmp_path, download=False)
+
+
+def test_dependencies_the_lock_file_leaves_out(tmp_path: Path, mirror: str) -> None:
+    # bokeh needs narwhals for a DataFrame source, which its lock entry doesn't list
+    root = ensure_distribution(["bokeh"], tmp_path, index_url=mirror)
+    assert "narwhals-2.18.1-py3-none-any.whl" in files(root)
+    assert extra_dependencies(["bokeh"], root) == ["narwhals"]
+    assert extra_dependencies(["Bokeh", "narwhals"], root) == []
+    assert extra_dependencies(["numpy"], root) == []
 
 
 def test_import_names(cache: Path) -> None:
