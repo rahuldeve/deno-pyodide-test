@@ -38,6 +38,50 @@ The instructions list the current variables, and mark one that changed after a c
 started (`df (DataFrame, changed since cell 3)`), so the model knows that a copy it
 made earlier is stale. Cells still can't change the store.
 
+## Host modules
+
+`sandbox_modules` preloads modules from the host into every session. Their public
+functions and classes are already defined in the cells, so the model calls them
+directly. The instructions list each one's signature and the first paragraph of its
+docstring:
+
+```python
+from myapp import sandbox_lib
+
+repl = PyodideRepl(sandbox_modules=[sandbox_lib], variables={"df": df})
+# the model's cell:  scores = zscore(host.df["revenue"])
+```
+
+They run **inside** the sandbox like the model's own code. So arguments never cross
+the process boundary (a DataFrame goes to one as it is), and plain code such as
+`df.apply(f)` can call them. They also get the sandbox's limits: no network, no host
+files, no secrets, no `deps`, and imports from the standard library and `packages`
+only, at the sandbox's versions. That suits pure computation, like domain formulas,
+cleaning steps and plotting presets. Code that needs the host is a job for host
+tools (callbacks), which aren't done yet.
+
+- **What ships:** a plain module's `.py` file, or every `.py` file of a package. A
+  submodule (`myapp.sandbox_lib`) keeps its dotted name, with empty `__init__.py`
+  files for its parents, so the rest of `myapp` stays on the host. The source is read
+  when the capability is created, and a module that can't be shipped (a built-in or
+  compiled one, a non-UTF-8 file, two modules exporting the same name, over 10 MB of
+  source) raises `ValueError` there.
+- **Public names:** `__all__` if the module defines it, else its top-level functions
+  and classes without a leading underscore that it defines itself (or, for a
+  package, that its submodules define), not those it imports.
+- **In the sandbox:** the files go to `/host_modules` in Pyodide's in-memory file
+  system, which is appended to `sys.path`, so tracebacks show the module's own lines.
+  `import sandbox_lib` works too, and `from sandbox_lib import f` brings back a name
+  the model overwrote. A module named like one the sandbox already has (`json`,
+  `pandas`), or one that raises on import, fails the session's start with the reason.
+  A session restarted after a timeout loads them again.
+- **Host variables:** pickles name classes by module, so a host variable holding an
+  instance of a class from a shipped module loads in the sandbox. A class defined
+  only on the host still can't.
+- **Not secret:** the model can read the whole module (`inspect.getsource`) and
+  replace its names. Keep secrets out of it, ship a dedicated module rather than the
+  app, and treat what its functions return as output from the sandbox.
+
 ## Plots
 
 A cell's `show(p)` (bokeh's own, from `bokeh.plotting` or `bokeh.io`) sends the
@@ -174,7 +218,7 @@ That is all the install there is, on Linux, macOS or Windows:
 ```sh
 uv sync
 uv run poe fetch     # optional; the first session downloads the same files
-uv run poe test      # 153 tests, ~6.5 min; the sandbox ones skip without Deno
+uv run poe test      # 173 tests, ~7 min; the sandbox ones skip without Deno
 uv run poe agent     # live demo on OpenRouter, needs OPENROUTER_API_KEY (AGENT_MODEL picks the model)
 uv run poe app       # the Gradio demo with a subagent and plots, on http://localhost:7860
 ```
@@ -185,11 +229,12 @@ uv run poe app       # the Gradio demo with a subagent and plots, on http://loca
 |---|---|
 | `src/pyodide_sandbox/repl.py` | `PyodideRepl`: `run_code`, `repl_history`, the cell index in the instructions, restart on timeout or crash |
 | `src/pyodide_sandbox/session.py` | `PyodideSession`: starts and kills the Deno process, speaks JSON lines, checks every reply |
+| `src/pyodide_sandbox/modules.py` | `SandboxModules`: reads the source and public names of `sandbox_modules`, and their section of the instructions |
 | `src/pyodide_sandbox/plots.py` | `Plot`, plots in tool-return metadata (`plots_in`), `subagent_return`, the `PlotAnswer` capability and `split_answer` |
 | `src/pyodide_sandbox/variables.py` | `VariableStore`: host values (DataFrames as Arrow, the rest pickled) in a temporary directory that only the session's Deno can read, and only read; the host changes it by replacing `view.json` in one rename |
 | `src/pyodide_sandbox/distribution.py` | Downloads and checks the Pyodide files the packages need; `python -m pyodide_sandbox fetch` |
 | `src/pyodide_sandbox/_deno/main.ts` | Imports Pyodide from those files (no npm), loads it and the packages, captures each cell's stdout and stderr (including C-level writes), caps them at 1 MB |
-| `src/pyodide_sandbox/_deno/runner.py` | Runs a cell in Pyodide: `CodeRunner` as `<cell-N>`, echoes the last expression's `repr`, trims tracebacks to the cell's frames |
+| `src/pyodide_sandbox/_deno/runner.py` | Runs a cell in Pyodide: `CodeRunner` as `<cell-N>`, echoes the last expression's `repr`, trims tracebacks to the cell's frames; installs host modules at boot |
 | `src/pyodide_sandbox/_deno/plots.py` | bokeh's `show()` in the sandbox: replaces `bokeh.io.showing._show_with_state`, so every `show` and output mode sends the object's `json_item` with the cell's reply, up to `max_plot_bytes` a cell |
 | `src/pyodide_sandbox/_deno/host.py` | The `host` object in the sandbox: reads the store's `view.json` and unpickles a value on every read, so each read is a fresh copy of the current value |
 
@@ -204,7 +249,7 @@ leaves Pyodide usable goes to the running cell's stderr, and the session goes on
 
 Host values other than DataFrames and Series are pickled on the host and unpickled
 in the sandbox (see "Using it as a library"). A class defined only on the host fails
-when a cell reads it. The store isn't mounted into Pyodide's filesystem: `host` reads
+when a cell reads it, unless its module is among `sandbox_modules`. The store isn't mounted into Pyodide's filesystem: `host` reads
 it with `Deno.readFileSync`. Through a NODEFS mount, a cell's `os.chmod` or `os.utime`
 reaches Deno, and Deno's refusal breaks Pyodide for good, even with the files
 read-only on the host. Through `Deno.readFileSync`, every refused call is an ordinary
@@ -234,7 +279,8 @@ exception in the cell.
 
 ## Not in phase 0
 
-- `host.tools`
+- Host tools: `await host.tools.NAME(...)` calling back to agent tools on the host,
+  for what `sandbox_modules` can't do (side effects, secrets, `deps`)
 - Snapshots and a warm pool, for startup time
 - A memory limit (needs a cgroup)
 - Running as another user, or seccomp
