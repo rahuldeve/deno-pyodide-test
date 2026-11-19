@@ -4,7 +4,8 @@
 //                           {"op": "load", "packages": ["pyarrow"]} between cells
 //   deno -> host (stdout):  {"op": "ready", "boot_ms": ...} once, then per cell
 //                           {"id": 1, "error": null | "ZeroDivisionError",
-//                            "stdout": "...", "stderr": "...", "duration_ms": ...}
+//                            "stdout": "...", "stderr": "...", "plots": [...],
+//                            "duration_ms": ...}
 //                           per load {"op": "loaded"}, or, when Pyodide can't go on,
 //                           {"op": "fatal", "message": "..."} just before the process
 //                           exits (code 70)
@@ -17,7 +18,7 @@
 //
 // Usage: deno run <flags> main.ts --dist DIR [--packages scikit-learn,pyarrow]
 //                                [--imports sklearn] [--max-output-bytes N] [--store DIR]
-//                                [--no-warmup]
+//                                [--no-warmup] [--max-plot-bytes N]
 //
 // --packages are loaded; --imports are imported at boot, so the first cell doesn't
 // pay for them. The host passes the modules of the packages it was asked for (from
@@ -29,6 +30,9 @@
 // A "load" adds a package the store came to need after boot (pyarrow, when the host
 // adds a DataFrame); a failure goes to stderr, and the cell reading the value then
 // gets an ImportError.
+//
+// With bokeh loaded, a cell's `show(obj)` adds `obj` to the cell's "plots", as
+// bokeh's json_item (plots.py), up to --max-plot-bytes of JSON per cell.
 
 import { pathToFileURL } from "node:url";
 
@@ -150,6 +154,11 @@ if (args.store) {
   );
   runnerNamespace.get("setup_host")(hostSource, args.store);
 }
+runnerNamespace.get("setup_plots")(
+  await Deno.readTextFile(new URL("./plots.py", import.meta.url)),
+  args.maxPlotBytes,
+);
+const takePlots = runnerNamespace.get("take_plots");
 for (const module of args.imports) {
   // not in __main__: a cell that uses `numpy` without importing it should fail
   pyodide.runPython(`import ${module}`, {
@@ -213,10 +222,13 @@ for await (const line of readLines(Deno.stdin.readable)) {
   // Output written between cells (by a task a cell left running) is not this cell's
   stdout.take();
   stderr.take();
+  takePlots();
   const start = performance.now();
   let error: string | null = null;
+  let plots: unknown[];
   try {
     error = (await runCell(request.code, request.id)) ?? null;
+    plots = JSON.parse(takePlots());
   } catch (e) {
     // run_cell catches all the cell's own exceptions, so this is Pyodide failing,
     // and its state can't be trusted
@@ -227,6 +239,7 @@ for await (const line of readLines(Deno.stdin.readable)) {
     error,
     stdout: stdout.take(),
     stderr: stderr.take(),
+    plots,
     duration_ms: performance.now() - start,
   });
 }
@@ -252,6 +265,7 @@ function parseArgs(argv: string[]) {
     packages: [] as string[],
     imports: [] as string[],
     maxOutputBytes: 1 << 20,
+    maxPlotBytes: 10_000_000,
     store: "",
     warmup: true,
   };
@@ -276,6 +290,10 @@ function parseArgs(argv: string[]) {
         break;
       case "--no-warmup":
         options.warmup = false;
+        break;
+      case "--max-plot-bytes":
+        options.maxPlotBytes = Number(value);
+        i++;
         break;
       case "--max-output-bytes":
         options.maxOutputBytes = Number(value);

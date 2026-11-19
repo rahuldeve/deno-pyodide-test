@@ -302,6 +302,30 @@ def test_no_warm_imports() -> None:
         session.close()
 
 
+def test_plots_are_capped_in_the_sandbox() -> None:
+    session = PyodideSession(("bokeh",), max_plot_bytes=20_000)
+    session.start()
+    try:
+        cell = (
+            "from bokeh.plotting import figure, show\n"
+            "p = figure()\np.line(list(range({n})), list(range({n})))\nshow(p)"
+        )
+        assert len(session.run(cell.format(n=10)).plots) == 1
+        # one plot over the limit, or two that add up to more
+        for code in [cell.format(n=3000), cell.format(n=900) + "\nshow(p)"]:
+            result = session.run(code)
+            assert result.error == "ValueError"
+            assert "at most 0.02 MB in all" in result.stderr
+            assert len(result.plots) == code.count("show(p)") - 1
+    finally:
+        session.close()
+
+
+def test_no_bokeh_no_plots(bare: PyodideSession) -> None:
+    result = bare.run("import bokeh")
+    assert (result.error, result.plots) == ("ModuleNotFoundError", [])
+
+
 def test_cell_ids_must_increase(bare: PyodideSession) -> None:
     bare.run("1", cell_id=5)
     with pytest.raises(ValueError, match="cell_id"):
