@@ -115,6 +115,7 @@ def test_dependencies_the_lock_file_leaves_out(tmp_path: Path, mirror: str) -> N
     assert extra_dependencies(["bokeh"], root) == ["narwhals"]
     assert extra_dependencies(["Bokeh", "narwhals"], root) == []
     assert extra_dependencies(["numpy"], root) == []
+    assert extra_dependencies(DEFAULT_PACKAGES, root) == ["narwhals"]
 
 
 def test_import_names(cache: Path) -> None:

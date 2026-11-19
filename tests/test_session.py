@@ -282,14 +282,14 @@ def test_packages_are_imported_by_their_modules_names() -> None:
 
 WARMED = """\
 import sys
-print([m in sys.modules for m in ("scipy.stats", "statsmodels.api")], "importlib" in globals())
+print([m in sys.modules for m in ("scipy.stats", "statsmodels.api", "narwhals")], "importlib" in globals())
 """
 
 
 def test_slow_submodules_are_imported_at_boot(numpy_session: PyodideSession) -> None:
     # by _deno/warmup.py, whose own names (importlib) stay out of __main__
     result = numpy_session.run(WARMED)
-    assert (result.error, result.stdout) == (None, "[True, True] False\n")
+    assert (result.error, result.stdout) == (None, "[True, True, True] False\n")
 
 
 def test_no_warm_imports() -> None:
@@ -297,9 +297,61 @@ def test_no_warm_imports() -> None:
     session.start()
     try:
         result = session.run(WARMED)
-        assert (result.error, result.stdout) == (None, "[False, False] False\n")
+        assert (result.error, result.stdout) == (None, "[False, False, False] False\n")
     finally:
         session.close()
+
+
+BOKEH_CELL = """\
+import pandas as pd
+from bokeh.io import output_file, output_notebook, reset_output
+from bokeh.layouts import column
+from bokeh.plotting import figure, show
+
+# a DataFrame source needs narwhals, which Pyodide's lock file leaves out
+p = figure(title="p")
+p.scatter("a", "b", source=pd.DataFrame({"a": [1, 2], "b": [2, 1]}))
+q = figure(title="q")
+q.line([1, 2], [3, 4])
+show(p)
+show(q)
+show(column(p, q))  # after showing each alone, which bokeh's own show() refuses
+show([p, q])  # a list is one plot, as bokeh would save it as one page
+output_notebook()  # what a model used to Jupyter writes: no IPython needed
+show(p)
+output_file("plot.html")  # no browser is opened, nor file written
+show(p)
+reset_output()
+show(p)
+import os
+os.path.exists("plot.html")
+"""
+
+
+def test_bokeh_show_sends_plots(numpy_session: PyodideSession) -> None:
+    result = numpy_session.run(BOKEH_CELL)
+    assert (result.error, result.stderr, result.stdout) == (None, "", "False\n")
+    assert [sorted(p) for p in result.plots] == [
+        ["doc", "root_id", "target_id", "version"]
+    ] * 7
+    roots = [p["doc"]["roots"][0] for p in result.plots]
+    assert [r["name"] for r in roots] == ["Figure", "Figure", "Column", "Column"] + [
+        "Figure"
+    ] * 3
+    assert {p["version"] for p in result.plots} == {"3.9.0"}
+    # plots belong to the cell that showed them
+    assert numpy_session.run("1").plots == []
+
+
+def test_bokeh_errors_are_the_cells(numpy_session: PyodideSession) -> None:
+    for code, error in [
+        ("from bokeh.plotting import show\nshow(lambda doc: None)", "RuntimeError"),
+        ("from bokeh.io import export_png", None),
+        ("from bokeh.io import export_png\nexport_png(p)", "RuntimeError"),
+        ("import bokeh.sampledata", "RuntimeError"),
+    ]:
+        result = numpy_session.run(code)
+        assert (result.error, result.plots) == (error, []), code
 
 
 def test_plots_are_capped_in_the_sandbox() -> None:

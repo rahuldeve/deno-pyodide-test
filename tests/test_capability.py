@@ -32,6 +32,7 @@ from pydantic_ai_harness.compaction import ClearToolResults
 
 from pyodide_sandbox.distribution import LOCK_FILE
 from pyodide_sandbox.repl import (
+    BOKEH,
     NUMERICS,
     SCIPY_LINALG,
     STATSMODELS,
@@ -165,8 +166,16 @@ def test_instructions_describe_the_sandbox() -> None:
     assert "Loaded: the standard library only." in bare
     assert "numpy" not in bare
     full = PyodideRepl()._instructions_text()
-    assert "Loaded: numpy, pandas, scipy, statsmodels, tzdata." in full
-    assert full.endswith(NUMERICS.format(scipy_linalg=SCIPY_LINALG) + STATSMODELS)
+    assert "Loaded: numpy, pandas, scipy, statsmodels, bokeh, tzdata." in full
+    assert full.endswith(
+        NUMERICS.format(scipy_linalg=SCIPY_LINALG)
+        + STATSMODELS
+        + BOKEH.format(max_plot_mb="10")
+    )
+    assert (
+        "at most 2.5 MB of JSON"
+        in PyodideRepl(max_plot_bytes=2_500_000)._instructions_text()
+    )
     no_scipy = PyodideRepl(("numpy",))._instructions_text()
     assert no_scipy.endswith(NUMERICS.format(scipy_linalg=""))
     assert "scipy" not in no_scipy

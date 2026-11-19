@@ -1,8 +1,8 @@
 r"""The parts of the Pyodide distribution a session needs, downloaded on first use.
 
 The full Pyodide release is 337 MB. A session needs only the runtime (about 14 MB)
-and the wheels of its packages and their dependencies (about 30 MB for numpy,
-pandas, scipy, statsmodels and tzdata), so `ensure_distribution` downloads just those into a
+and the wheels of its packages and their dependencies (about 39 MB for numpy,
+pandas, scipy, statsmodels, bokeh and tzdata), so `ensure_distribution` downloads just those into a
 cache directory, from Pyodide's CDN by default:
 
     $PYODIDE_DIST_DIR, else $XDG_CACHE_HOME/pyodide-sandbox/<version>, else
