@@ -6,6 +6,7 @@ from pyodide_sandbox.distribution import (
     DistributionError,
     ensure_distribution,
 )
+from pyodide_sandbox.modules import SandboxModules
 from pyodide_sandbox.plots import (
     PLOTS_KEY,
     DelegatedPlots,
@@ -37,6 +38,7 @@ __all__ = [
     "PlotAnswer",
     "PyodideRepl",
     "PyodideSession",
+    "SandboxModules",
     "SessionCrashed",
     "SessionError",
     "SessionTimeout",
