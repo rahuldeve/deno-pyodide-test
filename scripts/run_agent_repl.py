@@ -2,8 +2,9 @@
 
 Ported from eryx-test's script of the same name. The weather frame is built on the
 host and passed in as a host variable, so the agent's cells read it as `host.df`.
-Two questions are asked as two `agent.run()` calls sharing one conversation and one Pyodide
-session. `ClearToolResults` is set to clear aggressively so that, by the second
+Three questions are asked as three `agent.run()` calls sharing one conversation and one
+Pyodide session; the last asks for a bokeh plot, which `on_plot` saves as an HTML page
+(in the system's temp directory) to open in a browser. `ClearToolResults` is set to clear aggressively so that, by the second
 question, early cell outputs are gone from the conversation; the model can still
 find them through the cell index in the instructions and `repl_history`.
 Instruction changes are appended (`on_change="append"`), so the prompt cache
@@ -17,6 +18,7 @@ agent turns it on with the `cache` model setting; routes that can't cache ignore
 """
 
 import os
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -26,12 +28,13 @@ from pydantic_ai import Agent, capture_run_messages
 from pydantic_ai.messages import ModelRequest, ToolReturnPart
 from pydantic_ai_harness.compaction import ClearToolResults
 
-from pyodide_sandbox import PyodideRepl
+from pyodide_sandbox import Plot, PyodideRepl
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env.secret")
 
 MODEL = os.environ.get("AGENT_MODEL", "openrouter:nvidia/nemotron-3-ultra-550b-a55b:free")
 CLEARED = "[tool result cleared]"  # ClearToolResults' default placeholder
+PLOTS_DIR = Path(tempfile.gettempdir()) / "pyodide-sandbox-plots"
 
 
 def make_weather() -> pd.DataFrame:
@@ -61,11 +64,22 @@ QUESTIONS = [
         "in total, and on how many days did it rain there?"
     ),
     "For that city, what was the warmest week (7-day rolling mean of temp)?",
+    "Plot the 7-day rolling mean temperature of all three cities on one chart.",
 ]
 
 
+def save_plot(plot: Plot) -> None:
+    """Write the plot as a standalone page; it loads BokehJS from Bokeh's CDN."""
+    PLOTS_DIR.mkdir(exist_ok=True)
+    path = PLOTS_DIR / f"plot-{plot.number}.html"
+    path.write_text(plot.html(title=f"Plot {plot.number}"), encoding="utf-8")
+    print(f"[plot {plot.number} from cell {plot.cell} saved to {path}]")
+
+
 def main() -> None:
-    repl = PyodideRepl(variables={"df": make_weather()}, on_change="append")
+    repl = PyodideRepl(
+        variables={"df": make_weather()}, on_change="append", on_plot=save_plot
+    )
     repl.warm_up()  # boot while the model writes its first cell
     agent = Agent(
         MODEL,
