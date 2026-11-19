@@ -9,6 +9,7 @@ import copy
 import dataclasses
 import gc
 import json
+import re
 import warnings
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -30,7 +31,14 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai_harness.compaction import ClearToolResults
 
 from pyodide_sandbox.distribution import LOCK_FILE
-from pyodide_sandbox.repl import NUMERICS, SCIPY_LINALG, STATSMODELS, PyodideRepl
+from pyodide_sandbox.repl import (
+    BOKEH,
+    NUMERICS,
+    SCIPY_LINALG,
+    STATSMODELS,
+    Plot,
+    PyodideRepl,
+)
 from pyodide_sandbox.variables import VariableStore
 
 Call = tuple[str, dict[str, object]]
@@ -158,12 +166,21 @@ def test_instructions_describe_the_sandbox() -> None:
     assert "Loaded: the standard library only." in bare
     assert "numpy" not in bare
     full = PyodideRepl()._instructions_text()
-    assert "Loaded: numpy, pandas, scipy, statsmodels, tzdata." in full
-    assert full.endswith(NUMERICS.format(scipy_linalg=SCIPY_LINALG) + STATSMODELS)
+    assert "Loaded: numpy, pandas, scipy, statsmodels, bokeh, tzdata." in full
+    assert full.endswith(
+        NUMERICS.format(scipy_linalg=SCIPY_LINALG)
+        + STATSMODELS
+        + BOKEH.format(max_plot_mb="10")
+    )
+    assert (
+        "at most 2.5 MB of JSON"
+        in PyodideRepl(max_plot_bytes=2_500_000)._instructions_text()
+    )
     no_scipy = PyodideRepl(("numpy",))._instructions_text()
     assert no_scipy.endswith(NUMERICS.format(scipy_linalg=""))
     assert "scipy" not in no_scipy
     assert "statsmodels" not in no_scipy
+    assert "bokeh" not in no_scipy
 
 
 def test_instructions_follow_what_is_loaded(tmp_path: Path) -> None:
@@ -569,3 +586,77 @@ def test_rebinds_after_agent_is_gone(repl: PyodideRepl) -> None:
     gc.collect()
     make_agent(repl, Script(run_cells("1 + 1"))).run_sync("go")
     assert repl.cells[0].stdout == "2\n"
+
+
+SHOW = """\
+from bokeh.plotting import figure, show
+p = figure(title={title!r})
+p.line([1, 2, 3], [3, 1, 2])
+show(p)
+"""
+
+
+def test_plots_reach_the_host_and_the_model_is_told(
+    make_repl: Callable[..., PyodideRepl],
+) -> None:
+    seen: list[tuple[Plot, int]] = []
+    repl = make_repl(("bokeh",), on_plot=lambda p: seen.append((p, len(repl.cells))))
+    script = Script(
+        run_cells(
+            SHOW.format(title="one") + "show(p)",
+            "print('no plot')",
+            SHOW.format(title="two"),
+        )
+    )
+    result = make_agent(repl, script).run_sync("go")
+
+    ids = [p.id for p in repl.plots]
+    assert all(re.fullmatch("[0-9a-f]{8}", i) for i in ids) and len(set(ids)) == 3
+    assert tool_returns(result.all_messages()) == [
+        f"[cell 1]\n[plot {ids[0]}]\n[plot {ids[1]}]\n",
+        "[cell 2]\nno plot\n",
+        f"[cell 3]\n[plot {ids[2]}]\n",
+    ]
+    assert [(p.number, p.cell) for p in repl.plots] == [(1, 1), (2, 1), (3, 3)]
+    assert repl.cells[0].plots == repl.plots[:2]
+    # called once the cell is recorded, in order
+    assert [(p.number, n) for p, n in seen] == [(1, 1), (2, 1), (3, 3)]
+    assert seen[0][0] is repl.plots[0]
+    assert [p.title for p in repl.plots] == ["one", "one", "two"]
+    assert {p.json["version"] for p in repl.plots} == {"3.9.0"}
+    # history shows them too, and reset() starts counting again
+    assert f"[plot {ids[2]}]" in repl.cells[2].output()
+    repl.reset()
+    assert repl.plots == []
+
+
+def test_plot_ids_survive_clipping(make_repl: Callable[..., PyodideRepl]) -> None:
+    repl = make_repl(("bokeh",), max_output_chars=100)
+    script = Script(run_cells("print('x' * 500)\n" + SHOW.format(title="t")))
+    (returned,) = tool_returns(make_agent(repl, script).run_sync("go").all_messages())
+    assert "401 more characters" in returned  # 500 x and a newline, less 100
+    assert returned.endswith(f"output=True)\n[plot {repl.plots[0].id}]\n")
+
+
+def test_plot_too_big_for_the_cell(make_repl: Callable[..., PyodideRepl]) -> None:
+    repl = make_repl(("bokeh",), max_plot_bytes=6000)
+    assert "at most 0.006 MB of JSON" in repl._instructions_text()
+    script = Script(run_cells(SHOW.format(title="x" * 6000), SHOW.format(title="ok")))
+    returns = tool_returns(make_agent(repl, script).run_sync("go").all_messages())
+    assert re.search(
+        r"ValueError: this plot is 0\.0[0-9]+ MB of JSON, and a cell's plots can be "
+        r"at most 0\.006 MB in all",
+        returns[0],
+    )
+    assert returns[0].endswith("plot less data (aggregate, bin or sample it first)\n")
+    assert returns[1] == f"[cell 2]\n[plot {repl.plots[0].id}]\n"
+
+
+def test_on_plot_errors_end_the_run(make_repl: Callable[..., PyodideRepl]) -> None:
+    def fail(plot: Plot) -> None:
+        raise RuntimeError("the UI is gone")
+
+    repl = make_repl(("bokeh",), on_plot=fail)
+    with pytest.raises(RuntimeError, match="the UI is gone"):
+        make_agent(repl, Script(run_cells(SHOW.format(title="x")))).run_sync("go")
+    assert [p.number for p in repl.plots] == [1]

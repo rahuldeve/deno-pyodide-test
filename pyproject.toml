@@ -36,11 +36,13 @@ dev = [
     "ruff>=0.17.3",
     "pyarrow>=26",
     "python-dotenv>=1.2.4",
+    "gradio>=6.32.0",
 ]
 
 [tool.poe.tasks]
 fetch = { cmd = "python -m pyodide_sandbox fetch", help = "Download the Pyodide files the default packages need (sessions also do this on first use)" }
 agent = { cmd = "python scripts/run_agent_repl.py", help = "Let a pydantic-ai agent analyse data in the Pyodide REPL (needs OPENROUTER_API_KEY)" }
+app = { cmd = "python scripts/gradio_app.py", help = "Chat with a main agent and an analyst subagent in Gradio, with plots inline (needs OPENROUTER_API_KEY)" }
 test = { cmd = "pytest", help = "Run the tests" }
 fmt = { cmd = "ruff format", help = "Format the code" }
 lint = { cmd = "ruff check", help = "Lint the code" }

@@ -8,6 +8,13 @@
   and echoes the value of a bare last expression, as a REPL would.
 - `repl_history` returns the code of earlier cells, and their output on request.
 
+With bokeh loaded (a default package), a cell's `show(p)` sends the plot to the host
+as a `Plot` (bokeh's `json_item`), on `Cell.plots` and to `on_plot`, for the host
+to render with BokehJS. The model is told its id (`[plot 3f9a2c1b]`), and `run_code`
+returns the plots in its tool return's metadata, where they stay in the message
+history; `pyodide_sandbox.plots` has the rest, for letting the model choose which
+plots the user sees.
+
 With `variables=` (or a shared `store=`), code in a cell reads host values as
 `host.NAME` (see `pyodide_sandbox.variables`). The host can change them while the
 REPL runs (`repl.store.set(...)`): the instructions list the current variables and
@@ -33,12 +40,12 @@ import asyncio
 import threading
 import time
 import weakref
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import KW_ONLY, InitVar, dataclass, field
 from pathlib import Path
 from typing import Any, Self
 
-from pydantic_ai import FunctionToolset, RunContext
+from pydantic_ai import FunctionToolset, RunContext, ToolReturn
 from pydantic_ai.agent import AbstractAgent
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import InstructionChangePolicy, InstructionPart
@@ -48,6 +55,7 @@ from pyodide_sandbox.distribution import (
     DistributionError,
     loaded_packages,
 )
+from pyodide_sandbox.plots import Plot, plots_metadata, report_plots
 from pyodide_sandbox.session import (
     DEFAULT_PACKAGES,
     PyodideSession,
@@ -86,6 +94,17 @@ Python arithmetic and `math` still raise as usual. Check computed values with \
 SCIPY_LINALG = """ `scipy.linalg`'s `inv`, `solve` and `cholesky` do raise \
 `LinAlgError`, so use them when you need a matrix inverse or solve of your own."""
 
+BOKEH = """
+
+Plot with bokeh: `show(p)` (from `bokeh.plotting` or `bokeh.io`) saves a figure, \
+widget or layout (`column(p1, p2)`, `gridplot`) as an interactive plot, and \
+`run_code` reports its id, as in `[plot 3f9a2c1b]`. You can't see plots, so describe \
+each one from the values you computed, and give its id when you report on it. A \
+cell's plots can hold at most \
+{max_plot_mb} MB of JSON: aggregate, bin or sample larger data first. \
+`output_notebook` and `output_file` aren't needed; `bokeh.sampledata`, \
+`export_png` and `export_svg` aren't available."""
+
 # What tests/test_session.py::test_statsmodels_facts records
 STATSMODELS = """
 
@@ -114,12 +133,22 @@ class Cell:
     duration_ms: float
     store_generation: int = 0
     """The store's `generation` when the cell started."""
+    plots: list[Plot] = field(default_factory=list)
+    """The plots the cell showed, in order."""
 
     def output(self) -> str:
+        """What the cell printed, then the ids of the plots it showed."""
+        return self.printed() + self.plot_lines()
+
+    def printed(self) -> str:
+        """stdout, stderr, and the error if stderr doesn't name it."""
         parts = [self.stdout, self.stderr]
         if self.error and self.error not in self.stderr:
             parts.append(self.error + "\n")
         return "".join(parts)
+
+    def plot_lines(self) -> str:
+        return "".join(f"[plot {p.id}]\n" for p in self.plots)
 
     def summary(self, width: int = 80) -> str:
         """The cell's index line: number, ok/error and its first line of code."""
@@ -184,6 +213,15 @@ class PyodideRepl(AbstractCapability[Any]):
     """Each of a cell's stdout and stderr is cut to this inside the sandbox, so a
     cell can't flood the host; history keeps what is left."""
 
+    max_plot_bytes: int = 10_000_000
+    """The most JSON a cell's bokeh plots can add up to; a `show()` past it raises
+    `ValueError` in the cell, and the instructions tell the model the limit."""
+
+    on_plot: Callable[[Plot], None] | None = None
+    """Called with each plot a cell shows, once the cell has finished and is in
+    `cells`, in order. It runs in the worker thread that ran the cell, and an
+    exception from it ends the agent run. The plots are also kept on `Cell.plots`."""
+
     index_cells: int = 50
     """Most recent cells listed in the instructions; `0` lists none, only how many
     there are."""
@@ -205,7 +243,7 @@ class PyodideRepl(AbstractCapability[Any]):
 
     download: bool = True
     """Download the Pyodide files `packages` need when the first session starts, if
-    they aren't in `dist_dir` yet (about 44 MB for the default packages). With
+    they aren't in `dist_dir` yet (about 53 MB for the default packages). With
     `False`, a missing file fails the start; fetch them ahead of time with
     `python -m pyodide_sandbox fetch`."""
 
@@ -268,6 +306,11 @@ class PyodideRepl(AbstractCapability[Any]):
         return list(self._cells)
 
     @property
+    def plots(self) -> list[Plot]:
+        """Every cell's plots, in the order they were shown."""
+        return [plot for cell in self._cells for plot in cell.plots]
+
+    @property
     def session(self) -> PyodideSession | None:
         """The running session, if any (for its `boot_ms`, say)."""
         return self._session
@@ -313,7 +356,7 @@ class PyodideRepl(AbstractCapability[Any]):
     def get_instructions(self) -> Any:
         return self._instructions
 
-    async def run_code(self, ctx: RunContext[Any], code: str) -> str:
+    async def run_code(self, ctx: RunContext[Any], code: str) -> str | ToolReturn:
         """Run Python code in the persistent REPL and return what it printed.
 
         Args:
@@ -321,14 +364,21 @@ class PyodideRepl(AbstractCapability[Any]):
                 calls; a bare last expression is printed, as in a REPL.
         """
         cell = await asyncio.to_thread(self._execute, code)
-        output = cell.output() or "(no output)\n"
-        if len(output) > self.max_output_chars:
-            output = (
-                output[: self.max_output_chars]
-                + f"\n... {len(output) - self.max_output_chars} more characters, "
+        printed = cell.printed()
+        if len(printed) > self.max_output_chars:
+            printed = (
+                printed[: self.max_output_chars]
+                + f"\n... {len(printed) - self.max_output_chars} more characters, "
                 f"see repl_history(cell={cell.number}, output=True)\n"
             )
-        return f"[cell {cell.number}]\n{output}"
+        # after the clipping, so the model always learns the plots' ids
+        output = printed + cell.plot_lines() or "(no output)\n"
+        text = f"[cell {cell.number}]\n{output}"
+        if not cell.plots:
+            return text
+        report_plots(cell.plots)  # to the delegations running this cell, if any
+        # kept in the history with the result, but not sent to the model
+        return ToolReturn(return_value=text, metadata=plots_metadata(cell.plots))
 
     async def repl_history(
         self,
@@ -375,6 +425,8 @@ class PyodideRepl(AbstractCapability[Any]):
         )
         if "statsmodels" in loaded:
             text += STATSMODELS
+        if "bokeh" in loaded:
+            text += BOKEH.format(max_plot_mb=f"{self.max_plot_bytes / 1e6:.3g}")
         if names := self._host.names():
             entries = [self._host.info(n) for n in names]
             changed = {e.name: self._changed_since(e.generation) for e in entries}
@@ -418,6 +470,7 @@ class PyodideRepl(AbstractCapability[Any]):
                 dist_dir=self.dist_dir,
                 download=self.download,
                 max_output_bytes=self.max_output_bytes,
+                max_plot_bytes=self.max_plot_bytes,
                 store=self._host,
                 warm_imports=self.warm_imports,
             )
@@ -457,12 +510,14 @@ class PyodideRepl(AbstractCapability[Any]):
                 else self.execution_timeout_ms / 1000
             )
             stdout = stderr = ""
+            items: list[dict[str, Any]] = []
             # before the cell, so a change during it counts as after it started
             generation = self._host.generation
             start = time.perf_counter()
             try:
                 result = session.run(code, timeout=timeout, cell_id=number)
                 stdout, stderr, error = result.stdout, result.stderr, result.error
+                items = result.plots
             except DistributionError as e:
                 # pyarrow for a DataFrame added since the start; as for the start,
                 # a host problem, not the model's
@@ -484,7 +539,15 @@ class PyodideRepl(AbstractCapability[Any]):
                 duration_ms=(time.perf_counter() - start) * 1000,
                 store_generation=generation,
             )
+            shown = sum(len(c.plots) for c in self._cells)
+            cell.plots = [
+                Plot(number=shown + i, cell=number, json=item)
+                for i, item in enumerate(items, 1)
+            ]
             self._cells.append(cell)
+            if self.on_plot is not None:
+                for plot in cell.plots:
+                    self.on_plot(plot)
             return cell
 
 

@@ -26,13 +26,14 @@ import time
 import weakref
 from collections import deque
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any
 
 from pyodide_sandbox.distribution import (
     default_dist_dir,
     ensure_distribution,
+    extra_dependencies,
     import_names,
 )
 from pyodide_sandbox.variables import VariableStore
@@ -40,9 +41,10 @@ from pyodide_sandbox.variables import VariableStore
 # main.ts and the Python it runs inside Pyodide, shipped in the package
 DENO_DIR = Path(__file__).resolve().parent / "_deno"
 # tzdata: pandas and zoneinfo find no time zone without it (no system zoneinfo in wasm)
-DEFAULT_PACKAGES = ("numpy", "pandas", "scipy", "statsmodels", "tzdata")
+DEFAULT_PACKAGES = ("numpy", "pandas", "scipy", "statsmodels", "bokeh", "tzdata")
 
-# Limits on what Deno sends back; the in-sandbox cap on each stream is the real one
+# Limits on what Deno sends back; the in-sandbox caps on each stream and on a cell's
+# plots are the real ones. A reply may be this long plus `max_plot_bytes`.
 _MAX_LINE_BYTES = 8 << 20
 _STDERR_TAIL_LINES = 50
 _MAX_FATAL_CHARS = 1000
@@ -79,6 +81,9 @@ class CellResult:
     stdout: str
     stderr: str
     duration_ms: float
+    plots: list[dict[str, Any]] = field(default_factory=list)
+    """The bokeh objects the cell `show()`ed, in order, as `bokeh.embed.json_item`
+    made them. Written in the sandbox, so untrusted (see `pyodide_sandbox.repl.Plot`)."""
 
 
 class PyodideSession:
@@ -89,7 +94,9 @@ class PyodideSession:
     as `host.NAME`, and see the host's changes to it; the session keeps the store
     open while it holds it. With
     `warm_imports`, the boot also imports the packages' slow submodules
-    (`_deno/warmup.py`), so the first cell to use them doesn't.
+    (`_deno/warmup.py`), so the first cell to use them doesn't. With bokeh among the
+    packages, a cell's `show(obj)` adds `obj` to its result's `plots`, up to
+    `max_plot_bytes` of JSON per cell (more raises `ValueError` in the cell).
     """
 
     def __init__(
@@ -99,6 +106,7 @@ class PyodideSession:
         deno: str | None = None,
         dist_dir: str | Path | None = None,
         max_output_bytes: int = 1 << 20,
+        max_plot_bytes: int = 10_000_000,
         store: VariableStore | None = None,
         download: bool = True,
         warm_imports: bool = True,
@@ -108,6 +116,7 @@ class PyodideSession:
         self.deno = deno or default_deno()
         self.dist_dir = Path(dist_dir) if dist_dir else default_dist_dir()
         self.max_output_bytes = max_output_bytes
+        self.max_plot_bytes = max_plot_bytes
         self.store = store
         self.download = download
         self.boot_ms: float | None = None
@@ -140,11 +149,19 @@ class PyodideSession:
             # names checked against the lock file by ensure_distribution, which also
             # supplies the modules (dotted identifiers)
             "--packages",
-            ",".join([*self.packages, *self._load_only()]),
+            ",".join(
+                [
+                    *self.packages,
+                    *extra_dependencies(self.packages, root),
+                    *self._load_only(),
+                ]
+            ),
             "--imports",
             ",".join(import_names(self.packages, root)),
             "--max-output-bytes",
             str(self.max_output_bytes),
+            "--max-plot-bytes",
+            str(self.max_plot_bytes),
             *store,
             *([] if self.warm_imports else ["--no-warmup"]),
         ]
@@ -192,7 +209,11 @@ class PyodideSession:
         assert self._proc.stdout and self._proc.stderr
         threading.Thread(
             target=_read_messages,
-            args=(self._proc.stdout, self._messages),
+            args=(
+                self._proc.stdout,
+                self._messages,
+                _MAX_LINE_BYTES + self.max_plot_bytes,
+            ),
             daemon=True,
         ).start()
         threading.Thread(
@@ -229,15 +250,17 @@ class PyodideSession:
             reply.get("stdout"),
             reply.get("stderr"),
         )
-        duration = reply.get("duration_ms")
+        duration, plots = reply.get("duration_ms"), reply.get("plots")
         if not (
             (error is None or isinstance(error, str))
             and isinstance(stdout, str)
             and isinstance(stderr, str)
             and isinstance(duration, (int, float))
+            and isinstance(plots, list)
+            and all(isinstance(p, dict) for p in plots)
         ):
             raise self._die(SessionCrashed, "malformed reply from the sandbox")
-        return CellResult(error, stdout, stderr, float(duration))
+        return CellResult(error, stdout, stderr, float(duration), plots)
 
     def _load_store_packages(self, timeout: float | None) -> None:
         missing = [p for p in self._load_only() if p not in self._store_packages]
@@ -336,12 +359,14 @@ def _kill(proc: subprocess.Popen[bytes]) -> None:
 
 
 def _read_messages(
-    stream: IO[bytes], messages: "queue.Queue[dict[str, Any] | None]"
+    stream: IO[bytes],
+    messages: "queue.Queue[dict[str, Any] | None]",
+    max_line_bytes: int,
 ) -> None:
     """Parse Deno's stdout into `messages`; None when it ends or misbehaves."""
     try:
-        while line := stream.readline(_MAX_LINE_BYTES + 1):
-            if len(line) > _MAX_LINE_BYTES or not line.endswith(b"\n"):
+        while line := stream.readline(max_line_bytes + 1):
+            if len(line) > max_line_bytes or not line.endswith(b"\n"):
                 break
             try:
                 message = json.loads(line)

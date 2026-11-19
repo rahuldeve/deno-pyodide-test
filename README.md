@@ -2,9 +2,10 @@
 
 A pydantic-ai capability, `PyodideRepl`, that gives an agent a persistent, sandboxed
 Python REPL: Pyodide 314.0.7 (Python 3.14) running in its own Deno process, with
-numpy 2.4.6, pandas 3.0.2, scipy 1.18.0 and statsmodels 0.14.6 loaded from local
-files. Code in a cell
-reads host values (a DataFrame, say) as `host.NAME`. Phase 0 of the plan in
+numpy 2.4.6, pandas 3.0.2, scipy 1.18.0, statsmodels 0.14.6 and bokeh 3.9.0 loaded
+from local files. Code in a cell
+reads host values (a DataFrame, say) as `host.NAME`, and a bokeh plot it `show()`s
+goes to the host, to be shown to the user. Phase 0 of the plan in
 [Pyodide on Deno as an eryx backend](<Pyodide on Deno as an eryx backend.md>); the
 capability is a port of eryx-test's `EryxRepl`.
 
@@ -12,7 +13,7 @@ capability is a port of eryx-test's `EryxRepl`.
 from pydantic_ai import Agent
 from pyodide_sandbox import PyodideRepl
 
-# packages=("numpy", "pandas", "scipy", "statsmodels", "tzdata") by default
+# packages=("numpy", "pandas", "scipy", "statsmodels", "bokeh", "tzdata") by default
 repl = PyodideRepl(variables={"df": df}, on_change="append")
 agent = Agent("anthropic:claude-sonnet-5-5", capabilities=[repl])
 ```
@@ -37,6 +38,94 @@ The instructions list the current variables, and mark one that changed after a c
 started (`df (DataFrame, changed since cell 3)`), so the model knows that a copy it
 made earlier is stale. Cells still can't change the store.
 
+## Plots
+
+A cell's `show(p)` (bokeh's own, from `bokeh.plotting` or `bokeh.io`) sends the
+figure, widget or layout to the host as a `Plot`: bokeh's `json_item` JSON, not HTML
+or a script. The model is told its id (`[plot 3f9a2c1b]`), which is random, so it is
+unique across REPLs and agents; the model can't see the plot itself.
+
+```python
+def on_plot(plot: Plot) -> None:      # once the cell has finished, in order
+    ...                               # plot.json is bokeh's json_item
+
+repl = PyodideRepl(on_plot=on_plot)
+repl.cells[-1].plots                  # [Plot(number=1, cell=3)], also repl.plots
+```
+
+### Plots in an app
+
+`run_code` also puts a cell's plots in its tool return's `metadata`
+(`PLOTS_KEY`), which pydantic-ai keeps in the message history but never sends to the
+model. So the plots live wherever the conversation is stored, and survive
+`ClearToolResults` and a JSON round trip; `plots_in(messages)` finds them by id. With
+that, the agent that answers the user picks which plots the user sees, including
+plots made by a subagent, and the app gets them with the final answer
+(`pyodide_sandbox.plots`):
+
+```python
+from pydantic_ai_harness import SubAgent, SubAgents
+from pyodide_sandbox import DelegatedPlots, PlotAnswer, split_answer
+
+analyst = Agent(
+    model,
+    name="analyst",
+    deps_type=Conversation,
+    instructions="... report each plot's id and what it shows.",
+    capabilities=[lambda ctx: ctx.deps.repl],  # the conversation's own REPL
+)
+main = Agent(
+    model,
+    deps_type=Conversation,
+    capabilities=[
+        SubAgents(agents=[SubAgent(analyst)]),  # delegate_task, deps passed on
+        DelegatedPlots(),
+        PlotAnswer(),
+    ],
+)
+
+result = await main.run(prompt, message_history=conv.history, deps=conv)
+for piece in split_answer(result.output, result.all_messages()):
+    ...                               # str: markdown, Plot: render it
+```
+
+- `DelegatedPlots()` is for an agent that delegates with pydantic-ai-harness
+  `SubAgents`, whose `delegate_task` returns only the subagent's text. It collects
+  the plots REPLs make while the tool runs (in subagents of subagents too), lists
+  their ids (and titles) after that text (`Plots made: 3f9a2c1b (...)`), and moves
+  the plots into the caller's history. Pass `tool_names` if `SubAgents` was given
+  another `tool_name`.
+- A tool you write yourself, which runs a subagent with `await sub.run(...)`, returns
+  `subagent_return(result)` to the same effect.
+- `PlotAnswer()` tells the agent to place a plot by writing `{{plot:ID}}` on a line
+  of its own in its final answer, and sends an id that no tool reported back to it
+  for a retry. Plots it doesn't place aren't shown.
+- `split_answer` cuts the final text into markdown and `Plot`s, in order.
+
+`scripts/gradio_app.py` (`uv run poe app`) is a working example: a Gradio chat over a
+main agent and an analyst subagent (`SubAgents`), with one REPL per browser session
+and each plot in a sandboxed iframe
+(`<iframe sandbox="allow-scripts" srcdoc=...plot.html()...>`) inline in the answer.
+
+The page renders `plot.json` with `Bokeh.embed.embed_item(item, element_id)`,
+loading BokehJS of the same version (`plot.json["version"]`, 3.9.0) from
+`https://cdn.bokeh.org/bokeh/release/`: `bokeh-3.9.0.min.js`, plus
+`bokeh-widgets`, `bokeh-tables`, `bokeh-gl` and `bokeh-mathjax` for plots that use
+them. `plot.html()` is such a page, standalone.
+
+**A plot is untrusted content.** The model writes it, and a plot can carry
+JavaScript (`CustomJS`) and raw HTML (`Div`), which run in the browser that renders
+it. Render plots where that script can't reach the app or the user's session, such
+as a sandboxed iframe on another origin.
+
+A cell's plots can hold at most `max_plot_bytes` of JSON (10 MB by default; the
+instructions tell the model the limit); a `show()` past it raises `ValueError` in the
+cell. Some of bokeh can't work here: `export_png`/`export_svg` need a browser,
+`bokeh.sampledata` isn't packaged, and a Bokeh server app can't run. bokeh needs
+narwhals for a DataFrame source, which Pyodide's lock file doesn't list, so it is
+added (`distribution.EXTRA_DEPENDENCIES`). Unlike bokeh's own `show()`, showing `p`
+and then a layout holding `p` works.
+
 ## Using it as a library
 
 ```sh
@@ -51,7 +140,7 @@ That is all the install there is, on Linux, macOS or Windows:
   their modules (`sklearn`, `yaml`) are imported at boot, as the lock file names
   them.
 - **Pyodide** is downloaded when the first session starts: the runtime (14 MB) and
-  the wheels of `packages` with their dependencies (30 MB for the defaults), not the
+  the wheels of `packages` with their dependencies (39 MB for the defaults), not the
   337 MB release. They go to `$PYODIDE_DIST_DIR`, else
   `~/.cache/pyodide-sandbox/314.0.7` (`%LOCALAPPDATA%\pyodide-sandbox\314.0.7` on
   Windows; `$XDG_CACHE_HOME` is respected), and later
@@ -85,8 +174,9 @@ That is all the install there is, on Linux, macOS or Windows:
 ```sh
 uv sync
 uv run poe fetch     # optional; the first session downloads the same files
-uv run poe test      # 126 tests, ~4.5 min; the sandbox ones skip without Deno
+uv run poe test      # 153 tests, ~6.5 min; the sandbox ones skip without Deno
 uv run poe agent     # live demo on OpenRouter, needs OPENROUTER_API_KEY (AGENT_MODEL picks the model)
+uv run poe app       # the Gradio demo with a subagent and plots, on http://localhost:7860
 ```
 
 ## How it fits together
@@ -95,10 +185,12 @@ uv run poe agent     # live demo on OpenRouter, needs OPENROUTER_API_KEY (AGENT_
 |---|---|
 | `src/pyodide_sandbox/repl.py` | `PyodideRepl`: `run_code`, `repl_history`, the cell index in the instructions, restart on timeout or crash |
 | `src/pyodide_sandbox/session.py` | `PyodideSession`: starts and kills the Deno process, speaks JSON lines, checks every reply |
+| `src/pyodide_sandbox/plots.py` | `Plot`, plots in tool-return metadata (`plots_in`), `subagent_return`, the `PlotAnswer` capability and `split_answer` |
 | `src/pyodide_sandbox/variables.py` | `VariableStore`: host values (DataFrames as Arrow, the rest pickled) in a temporary directory that only the session's Deno can read, and only read; the host changes it by replacing `view.json` in one rename |
 | `src/pyodide_sandbox/distribution.py` | Downloads and checks the Pyodide files the packages need; `python -m pyodide_sandbox fetch` |
 | `src/pyodide_sandbox/_deno/main.ts` | Imports Pyodide from those files (no npm), loads it and the packages, captures each cell's stdout and stderr (including C-level writes), caps them at 1 MB |
 | `src/pyodide_sandbox/_deno/runner.py` | Runs a cell in Pyodide: `CodeRunner` as `<cell-N>`, echoes the last expression's `repr`, trims tracebacks to the cell's frames |
+| `src/pyodide_sandbox/_deno/plots.py` | bokeh's `show()` in the sandbox: replaces `bokeh.io.showing._show_with_state`, so every `show` and output mode sends the object's `json_item` with the cell's reply, up to `max_plot_bytes` a cell |
 | `src/pyodide_sandbox/_deno/host.py` | The `host` object in the sandbox: reads the store's `view.json` and unpickles a value on every read, so each read is a fresh copy of the current value |
 
 Deno runs with `--no-prompt --cached-only --no-remote --allow-read=<_deno>,<Pyodide files>,<store>`,
@@ -136,6 +228,8 @@ exception in the cell.
 | Warm imports (`_deno/warmup.py`) | About +4.8 s of boot with the default packages. The first cell to import `statsmodels.api` and `scipy.stats`, `optimize` and `linalg` then takes 0.02 s instead of 4.9 s, so the first-cell costs in the scipy and statsmodels rows are those of `warm_imports=False` |
 | statsmodels | OLS and formulas (patsy), Logit, GLM, MixedLM, ARIMA and SARIMAX (Cython state space), Holt-Winters, lowess and `anova_lm` work. A fitted model pickled on the host loads and predicts in the sandbox |
 | scipy's C and C++ code | qhull, the k-d tree, HiGHS (`linprog`, `milp`), sparse solvers and signal filters work, and their errors are ordinary exceptions |
+| Boot with `bokeh` as well | About +2.6 s with warm imports (22 s for all six against 19.5 s, on a slower day than the rows above); bokeh and its dependencies add 8.4 MB of download. The first cell to show a plot takes about 0.25 s |
+| bokeh | Figures from lists, arrays and DataFrames, layouts, widgets, `CustomJS`, tile maps and themes serialize; a page from `Plot.html()` renders in Edge. `output_notebook()`, `output_file()` and `reset_output()` are harmless |
 | `pyodide.mountNodeFS` under Deno | Reads work. A write, `chmod` or `utime` that reaches Deno is fatal to Pyodide (not used) |
 
 ## Not in phase 0

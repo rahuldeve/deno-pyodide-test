@@ -6,8 +6,8 @@
 # ahead of the first cell (PyodideRepl.warm_up).
 #
 # Only for packages the session has imported: a module is skipped unless its
-# top-level package is in sys.modules. Nothing reaches __main__, so a cell still has
-# to import what it uses.
+# top-level package is in sys.modules, or the package in NEEDED_BY is. Nothing
+# reaches __main__, so a cell still has to import what it uses.
 
 import importlib
 import sys
@@ -32,10 +32,17 @@ SUBMODULES = (
     "statsmodels.formula.api",
     "statsmodels.tsa.api",
     "statsmodels.stats.api",
+    "bokeh.plotting",  # plots.py has already imported most of bokeh
+    "bokeh.models",
+    "bokeh.palettes",
+    "bokeh.transform",
+    "narwhals.stable.v1",  # 0.5; bokeh imports it for ColumnDataSource(df)
 )
+# Imported for another package, which imports it only when first needed
+NEEDED_BY = {"narwhals.stable.v1": "bokeh"}
 
 for name in SUBMODULES:
-    if name.partition(".")[0] not in sys.modules:
+    if NEEDED_BY.get(name, name).partition(".")[0] not in sys.modules:
         continue
     try:
         importlib.import_module(name)

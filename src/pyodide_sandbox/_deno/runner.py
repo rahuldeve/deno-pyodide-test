@@ -13,10 +13,13 @@ Output isn't captured here: main.ts captures the process's stdout and stderr per
 cell, which also catches what C extensions write. The cell's variables live in
 `__main__`, so classes and functions the model defines can be pickled.
 
-With a variable store, `setup_host` also defines `host` there (see `host.py`).
+With a variable store, `setup_host` also defines `host` there (see `host.py`). With
+bokeh loaded, `setup_plots` makes its `show()` collect plots for the host instead of
+opening a browser (see `plots.py`); main.ts sends them with the cell's result.
 """
 
 import ast
+import importlib.util
 import linecache
 import sys
 import traceback
@@ -28,7 +31,17 @@ from pyodide.ffi import JsException
 import __main__
 
 _CELL_PREFIX = "<cell-"
-_HOST_FILENAME = "<host>"
+
+# The running cell's bokeh plots (plots.Plots), with bokeh loaded
+_plots = None
+
+
+def _load_module(source: str, filename: str) -> dict:
+    """Run `source` in a namespace of its own, with its lines in tracebacks."""
+    linecache.cache[filename] = (len(source), None, source.splitlines(True), filename)
+    namespace = {"__name__": f"pyodide_{filename.strip('<>')}"}
+    exec(compile(source, filename, "exec"), namespace)  # noqa: S102
+    return namespace
 
 
 def setup_host(source: str, root: str) -> None:
@@ -37,17 +50,24 @@ def setup_host(source: str, root: str) -> None:
     `source` is host.py, run in a namespace of its own so that only `host` reaches
     the cells. The store is read once here, so a missing one fails the boot.
     """
-    linecache.cache[_HOST_FILENAME] = (
-        len(source),
-        None,
-        source.splitlines(True),
-        _HOST_FILENAME,
-    )
-    namespace = {"__name__": "pyodide_host"}
-    exec(compile(source, _HOST_FILENAME, "exec"), namespace)  # noqa: S102
-    host = namespace["Host"](root, _read_through_deno)
+    host = _load_module(source, "<host>")["Host"](root, _read_through_deno)
     len(host)
     __main__.host = host
+
+
+def setup_plots(source: str, max_bytes: int) -> None:
+    """Make bokeh's `show()` collect plots, up to `max_bytes` a cell; `source` is
+    plots.py. Does nothing without bokeh."""
+    global _plots
+    if importlib.util.find_spec("bokeh") is None:
+        return
+    _plots = _load_module(source, "<plots>")["Plots"](max_bytes)
+    _plots.install()
+
+
+def take_plots() -> str:
+    """The plots shown since the last call, as a JSON array of bokeh json_items."""
+    return "[]" if _plots is None else _plots.take()
 
 
 def _read_through_deno(path: str) -> bytes:

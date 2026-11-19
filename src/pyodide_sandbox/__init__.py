@@ -6,6 +6,15 @@ from pyodide_sandbox.distribution import (
     DistributionError,
     ensure_distribution,
 )
+from pyodide_sandbox.plots import (
+    PLOTS_KEY,
+    DelegatedPlots,
+    Plot,
+    PlotAnswer,
+    plots_in,
+    split_answer,
+    subagent_return,
+)
 from pyodide_sandbox.repl import Cell, PyodideRepl
 from pyodide_sandbox.session import (
     CellResult,
@@ -17,11 +26,15 @@ from pyodide_sandbox.session import (
 from pyodide_sandbox.variables import VariableStore, VersionMismatchWarning
 
 __all__ = [
+    "PLOTS_KEY",
     "PYODIDE_VERSION",
     "SANDBOX_VERSIONS",
     "Cell",
     "CellResult",
+    "DelegatedPlots",
     "DistributionError",
+    "Plot",
+    "PlotAnswer",
     "PyodideRepl",
     "PyodideSession",
     "SessionCrashed",
@@ -30,4 +43,7 @@ __all__ = [
     "VariableStore",
     "VersionMismatchWarning",
     "ensure_distribution",
+    "plots_in",
+    "split_answer",
+    "subagent_return",
 ]
